@@ -1,6 +1,11 @@
 import os
+# One BLAS/OpenMP thread per process; parallelism comes from --num_workers.
+# Must be set before numpy is imported, otherwise every worker spawns one thread per core.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
 import argparse
 import json
+import random
 
 from diffusion_planner.data_process.data_processor import DataProcessor
 
@@ -51,7 +56,14 @@ if __name__ == "__main__":
 
     parser.add_argument('--route_len', type=int, help='number of route lane point', default=20)
     parser.add_argument('--route_num', type=int, help='number of route lanes', default=25)
+
+    parser.add_argument('--num_workers', type=int, help='number of parallel processes', default=len(os.sched_getaffinity(0)))
+    parser.add_argument('--num_shards', type=int, help='split scenarios into this many shards (e.g. one per node)', default=1)
+    parser.add_argument('--shard_id', type=int, help='index of the shard to process on this node, in [0, num_shards)', default=0)
+    parser.add_argument('--max_tasks_per_child', type=int, help='restart each worker after this many scenarios to release cached memory', default=500)
+    parser.add_argument('--seed', type=int, help='random seed for scenario sampling; must match across shards', default=0)
     args = parser.parse_args()
+    assert 0 <= args.shard_id < args.num_shards, f"shard_id must be in [0, {args.num_shards})"
 
     # create save folder
     os.makedirs(args.save_path, exist_ok=True)
@@ -67,19 +79,35 @@ if __name__ == "__main__":
     builder = NuPlanScenarioBuilder(args.data_path, args.map_path, sensor_root, db_files, map_version)
     scenario_filter = ScenarioFilter(*get_filter_parameters(args.scenarios_per_type, args.total_scenarios, args.shuffle_scenarios, log_names=log_names))
 
-    worker = SingleMachineParallelExecutor(use_process_pool=True)
+    # Fixed seed so every shard samples and shuffles the same scenario list
+    random.seed(args.seed)
+    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=args.num_workers)
     scenarios = builder.get_scenarios(scenario_filter, worker)
     print(f"Total number of scenarios: {len(scenarios)}")
+
+    # Split into contiguous shards of the log-sorted list, so each log stays (mostly) on one node
+    scenarios = sorted(scenarios, key=lambda s: (s.log_name, s.token))
+    shard_size = -(-len(scenarios) // args.num_shards)
+    shard_scenarios = scenarios[args.shard_id * shard_size:(args.shard_id + 1) * shard_size]
+    if args.num_shards > 1:
+        print(f"Shard {args.shard_id}/{args.num_shards}: {len(shard_scenarios)} scenarios")
 
     # process data
     del worker, builder, scenario_filter
     processor = DataProcessor(args)
-    processor.work(scenarios)
+    processor.work(shard_scenarios, num_workers=args.num_workers, max_tasks_per_child=args.max_tasks_per_child)
 
-    npz_files = [f for f in os.listdir(args.save_path) if f.endswith('.npz')]
+    # Only write the file list once every shard has finished, so it matches a single-node run
+    existing_files = set(os.listdir(args.save_path))
+    num_missing = sum(f"{s._map_name}_{s.token}.npz" not in existing_files for s in scenarios)
+    if num_missing > 0:
+        print(f"{num_missing} scenarios from other shards are not finished yet; "
+              f"the last shard to finish writes diffusion_planner_training.json")
+    else:
+        npz_files = sorted(f for f in existing_files if f.endswith('.npz'))
 
-    # Save the list to a JSON file
-    with open('./diffusion_planner_training.json', 'w') as json_file:
-        json.dump(npz_files, json_file, indent=4)
+        # Save the list to a JSON file
+        with open('./diffusion_planner_training.json', 'w') as json_file:
+            json.dump(npz_files, json_file, indent=4)
 
-    print(f"Saved {len(npz_files)} .npz file names")
+        print(f"Saved {len(npz_files)} .npz file names")

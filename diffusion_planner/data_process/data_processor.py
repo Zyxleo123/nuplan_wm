@@ -1,4 +1,8 @@
+import gc
+import os
+import socket
 import numpy as np
+from multiprocessing import Pool
 from tqdm import tqdm
 
 from nuplan.common.actor_state.state_representation import Point2D
@@ -77,84 +81,117 @@ class DataProcessor(object):
         return data
     
     # Use for data preprocess
-    def work(self, scenarios):
+    def work(self, scenarios, num_workers=1, max_tasks_per_child=500):
 
-        for scenario in tqdm(scenarios):
-            map_name = scenario._map_name
-            token = scenario.token
-            map_api = scenario.map_api        
+        # Process scenarios of the same log consecutively so DB reads hit the file cache
+        scenarios = sorted(scenarios, key=lambda s: s.log_name)
 
-            '''
-            ego & agents past
-            '''
-            ego_state = scenario.initial_ego_state
-            ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
-            anchor_ego_state = np.array([ego_state.rear_axle.x, ego_state.rear_axle.y, ego_state.rear_axle.heading], dtype=np.float64)
-            ego_agent_past, time_stamps_past = get_ego_past_array_from_scenario(scenario, self.num_past_poses, self.past_time_horizon)
+        if num_workers <= 1:
+            for scenario in tqdm(scenarios):
+                self.process_scenario(scenario)
+            return
 
-            present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
-            past_tracked_objects = [
-                tracked_objects.tracked_objects
-                for tracked_objects in scenario.get_past_tracked_objects(
-                    iteration=0, time_horizon=self.past_time_horizon, num_samples=self.num_past_poses
-                )
-            ]
-            sampled_past_observations = past_tracked_objects + [present_tracked_objects]
-            neighbor_agents_past, neighbor_agents_types = \
-                sampled_tracked_objects_to_array_list(sampled_past_observations)
-            
-            static_objects, static_objects_types = sampled_static_objects_to_array_list(present_tracked_objects)
+        # Move the parent's objects (e.g. the scenario list) out of gc tracking, so gc in the
+        # forked workers does not touch them and copy-on-write does not duplicate them per worker
+        gc.collect()
+        gc.freeze()
 
-            ego_agent_past, neighbor_agents_past, neighbor_indices, static_objects = \
-                agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
-            
-            '''
-            Map
-            '''
-            route_roadblock_ids = scenario.get_route_roadblock_ids()
-            traffic_light_data = list(scenario.get_traffic_light_status_at_iteration(0))
+        # Each worker caches every map object it queries (NuPlanMap._map_objects), which grows
+        # without bound; restart workers after max_tasks_per_child scenarios to release it.
+        # chunksize=1 so the progress bar advances once per finished scenario
+        with Pool(processes=num_workers, maxtasksperchild=max_tasks_per_child) as pool:
+            for _ in tqdm(pool.imap_unordered(self.process_scenario, scenarios, chunksize=1), total=len(scenarios)):
+                pass
 
-            if route_roadblock_ids != ['']:
-                route_roadblock_ids = route_roadblock_correction(
-                    ego_state, map_api, route_roadblock_ids
-                )
+    def process_scenario(self, scenario):
+        map_name = scenario._map_name
+        token = scenario.token
 
-            coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
-                map_api, self._map_features, ego_coords, self._radius, traffic_light_data
+        # Skip scenarios already processed by a previous run
+        if os.path.exists(self._save_file(self._save_dir, map_name, token)):
+            return
+
+        map_api = scenario.map_api        
+
+        '''
+        ego & agents past
+        '''
+        ego_state = scenario.initial_ego_state
+        ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
+        anchor_ego_state = np.array([ego_state.rear_axle.x, ego_state.rear_axle.y, ego_state.rear_axle.heading], dtype=np.float64)
+        ego_agent_past, time_stamps_past = get_ego_past_array_from_scenario(scenario, self.num_past_poses, self.past_time_horizon)
+
+        present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
+        past_tracked_objects = [
+            tracked_objects.tracked_objects
+            for tracked_objects in scenario.get_past_tracked_objects(
+                iteration=0, time_horizon=self.past_time_horizon, num_samples=self.num_past_poses
+            )
+        ]
+        sampled_past_observations = past_tracked_objects + [present_tracked_objects]
+        neighbor_agents_past, neighbor_agents_types = \
+            sampled_tracked_objects_to_array_list(sampled_past_observations)
+        
+        static_objects, static_objects_types = sampled_static_objects_to_array_list(present_tracked_objects)
+
+        ego_agent_past, neighbor_agents_past, neighbor_indices, static_objects = \
+            agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
+        
+        '''
+        Map
+        '''
+        route_roadblock_ids = scenario.get_route_roadblock_ids()
+        traffic_light_data = list(scenario.get_traffic_light_status_at_iteration(0))
+
+        if route_roadblock_ids != ['']:
+            route_roadblock_ids = route_roadblock_correction(
+                ego_state, map_api, route_roadblock_ids
             )
 
-            vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords, traffic_light_data, speed_limit, lane_route, self._map_features, 
-                                    self._max_elements, self._max_points)
+        coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
+            map_api, self._map_features, ego_coords, self._radius, traffic_light_data
+        )
 
-            '''
-            ego & agents future
-            '''
-            ego_agent_future = get_ego_future_array_from_scenario(scenario, ego_state, self.num_future_poses, self.future_time_horizon)
+        vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords, traffic_light_data, speed_limit, lane_route, self._map_features, 
+                                self._max_elements, self._max_points)
 
-            present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
-            future_tracked_objects = [
-                tracked_objects.tracked_objects
-                for tracked_objects in scenario.get_future_tracked_objects(
-                    iteration=0, time_horizon=self.future_time_horizon, num_samples=self.num_future_poses
-                )
-            ]
+        '''
+        ego & agents future
+        '''
+        ego_agent_future = get_ego_future_array_from_scenario(scenario, ego_state, self.num_future_poses, self.future_time_horizon)
 
-            sampled_future_observations = [present_tracked_objects] + future_tracked_objects
-            future_tracked_objects_array_list, _ = sampled_tracked_objects_to_array_list(sampled_future_observations)
-            neighbor_agents_future = agent_future_process(anchor_ego_state, future_tracked_objects_array_list, self.num_agents, neighbor_indices)
+        present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
+        future_tracked_objects = [
+            tracked_objects.tracked_objects
+            for tracked_objects in scenario.get_future_tracked_objects(
+                iteration=0, time_horizon=self.future_time_horizon, num_samples=self.num_future_poses
+            )
+        ]
+
+        sampled_future_observations = [present_tracked_objects] + future_tracked_objects
+        future_tracked_objects_array_list, _ = sampled_tracked_objects_to_array_list(sampled_future_observations)
+        neighbor_agents_future = agent_future_process(anchor_ego_state, future_tracked_objects_array_list, self.num_agents, neighbor_indices)
 
 
-            '''
-            ego current
-            '''
-            ego_current_state = calculate_additional_ego_states(ego_agent_past, time_stamps_past)
+        '''
+        ego current
+        '''
+        ego_current_state = calculate_additional_ego_states(ego_agent_past, time_stamps_past)
 
-            # gather data
-            data = {"map_name": map_name, "token": token, "ego_current_state": ego_current_state, "ego_agent_future": ego_agent_future,
-                    "neighbor_agents_past": neighbor_agents_past, "neighbor_agents_future": neighbor_agents_future, "static_objects": static_objects}
-            data.update(vector_map)
+        # gather data
+        data = {"map_name": map_name, "token": token, "ego_current_state": ego_current_state, "ego_agent_future": ego_agent_future,
+                "neighbor_agents_past": neighbor_agents_past, "neighbor_agents_future": neighbor_agents_future, "static_objects": static_objects}
+        data.update(vector_map)
 
-            self.save_to_disk(self._save_dir, data)
+        self.save_to_disk(self._save_dir, data)
+
+    def _save_file(self, dir, map_name, token):
+        return f"{dir}/{map_name}_{token}.npz"
 
     def save_to_disk(self, dir, data):
-        np.savez(f"{dir}/{data['map_name']}_{data['token']}.npz", **data)
+        # Write to a temp file and rename, so an interrupted run never leaves a truncated .npz
+        save_file = self._save_file(dir, data['map_name'], data['token'])
+        tmp_file = f"{save_file}.tmp.{socket.gethostname()}.{os.getpid()}"
+        with open(tmp_file, "wb") as f:
+            np.savez(f, **data)
+        os.replace(tmp_file, save_file)
