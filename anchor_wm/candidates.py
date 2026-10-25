@@ -178,17 +178,24 @@ def _points_in_polygons(q: torch.Tensor, poly: torch.Tensor) -> torch.Tensor:
 
 
 def in_common_or_connected_lanes(corners: torch.Tensor, lane_poly: torch.Tensor, lane_valid: torch.Tensor,
-                                 chunk: int = 1024) -> torch.Tensor:
+                                 lane_succ: torch.Tensor, chunk: int = 1024) -> torch.Tensor:
     """[E] True where all four ego corners [E,4,2] (FL, FR, RR, RL) lie in one lane / lane connector, or the
-    two front and the two rear corners each share one (crossing into a connected lane): nuplan's
-    `get_timestamps_in_common_or_connected_route_objs`, without the lane graph (connectivity is assumed when
-    front and rear pairs each share a lane)."""
+    two front corners share one that is the successor of a lane the two rear corners share (crossing from a
+    lane into its connector or the reverse): nuplan's `get_timestamps_in_common_or_connected_route_objs`.
+    lane_succ [E,L,S]: successor indices (-1 = none)."""
     out = []
+    n = lane_poly.shape[1]
     for e0 in range(0, corners.shape[0], chunk):
-        inside = _points_in_polygons(corners[e0:e0 + chunk], lane_poly[e0:e0 + chunk]) & lane_valid[e0:e0 + chunk, None]
+        sl = slice(e0, e0 + chunk)
+        inside = _points_in_polygons(corners[sl], lane_poly[sl]) & lane_valid[sl, None]
         common = inside.all(1).any(-1)
-        front, rear = (inside[:, 0] & inside[:, 1]).any(-1), (inside[:, 2] & inside[:, 3]).any(-1)
-        out.append(common | (front & rear))
+        front, rear = inside[:, 0] & inside[:, 1], inside[:, 2] & inside[:, 3]               # [e,L]
+        succ = lane_succ[sl].long()
+        adj = torch.zeros((succ.shape[0], n + 1, n + 1), dtype=torch.bool, device=corners.device)
+        adj.scatter_(2, torch.where(succ >= 0, succ, torch.full_like(succ, n)), True)        # [e,L(+pad),L(+pad)]
+        adj = adj[:, :n, :n]
+        connected = (torch.bmm(rear.float()[:, None], adj.float())[:, 0] > 0) & front        # rear lane -> front lane
+        out.append(common | connected.any(-1))
     return torch.cat(out) if out else torch.zeros(0, dtype=torch.bool, device=corners.device)
 
 
@@ -234,7 +241,7 @@ def label_candidates(f: dict, cand_xy: torch.Tensor, cand_yaw: torch.Tensor, dt:
     ego_c = box_corners(ego_center(g_xy, g_yaw), g_yaw, ego_lw)                            # [B,C,Tg,4,2] FL, FR, RR, RL
     heading = torch.stack([torch.cos(g_yaw), torch.sin(g_yaw)], -1)
     o_static = f["fut_static"].bool()
-    lane_poly, lane_valid = f["lane_poly"].float(), f["lane_poly_valid"].bool()
+    lane_poly, lane_valid, lane_succ = f["lane_poly"].float(), f["lane_poly_valid"].bool(), f["lane_succ"]
 
     # Per object: first contact, its classification and the min gap, chunked over objects.
     any_hit = torch.zeros((b, c), dtype=torch.bool, device=dev)
@@ -262,7 +269,7 @@ def label_candidates(f: dict, cand_xy: torch.Tensor, cand_yaw: torch.Tensor, dt:
         lateral = hit & ~ego_stopped & ~obj_stopped & ~behind & ~front
         if lateral.any():
             bi, ci, ni = lateral.nonzero(as_tuple=True)
-            ok = in_common_or_connected_lanes(ec[bi, ci, ni], lane_poly[bi], lane_valid[bi])
+            ok = in_common_or_connected_lanes(ec[bi, ci, ni], lane_poly[bi], lane_valid[bi], lane_succ[bi])
             fault[bi, ci, ni] = ~ok
         any_hit |= hit.any(-1)
         at_fault |= fault.any(-1)

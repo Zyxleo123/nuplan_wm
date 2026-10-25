@@ -65,8 +65,9 @@ Train on a subset of the cache with `--file_list subset.json` (a JSON list of ca
 |---|---|
 | `ego_pose / ego_vel / ego_acc` [101] | ego history (the ego is decoded like any agent) and logged future |
 | `obj_*`: every tracked object within 120 m in any frame, with per-frame validity | agent history / targets with real masks (the DP cache pads missing frames with the nearest state or zeros); log-replay boxes for overlap labels include static objects and objects that appear later |
-| `lane_*` (+ LANE / LANE_CONNECTOR type), `poly_*` (crosswalks, stop lines) | map tokens |
-| `route_xy` | ordered route centreline (lane path through the corrected route roadblocks), for progress labels and route features |
+| `lane_*` within 120 m (up to 256, + LANE / LANE_CONNECTOR type, ids, topology: successors / predecessors / left / right neighbours), `poly_*` (crosswalks, stop lines, intersections) | map tokens; the lane graph gives reference lines (PLUTO / PlanTF) and nuPlan's exact connected-lane / driving-direction tests |
+| `lane_tl_future` | traffic-light state per lane at t = 0, 0.5, ..., 8 s, for red-light labels (NAVSIM EPDMS) |
+| `route_xy`, `route_roadblock_ids` | ordered route centreline (lane path through the corrected route roadblocks) and the route itself, for progress labels and route features |
 | `da_*` | drivable-area boundary (PDMS / nuplan `drivable_area_compliance`), for offroad labels and scorer tokens |
 | `goal_pose / goal_valid` | mission goal (only used with `--use_goal`) |
 | `log_name`, `scenario_type` | log-level train / val split; subsets |
@@ -74,7 +75,8 @@ Train on a subset of the cache with `--file_list subset.json` (a JSON list of ca
 The time grid is 0.1 s (21 past frames incl. t = 0, 80 future frames), which the model uses as is
 (`history_stride` / `future_stride` in `config.py` subsample it).
 Files are named `<log_name>__<token>.npz` so the split needs no file reads. A scenario takes about
-300 KB, so the 1M-scenario training set is about 300 GB.
+500 KB (330 KB on babel's compressed /data/user_data), so the 1M-scenario training set is about 330 GB there;
+object arrays dominate, so objects are capped at the 192 the labels use and their velocities are float16.
 
 Building it reads each log once: every scenario's 101 frames come from one pass over the log's lidar
 frames / ego poses / boxes (`LogData`, the same rows and frame sampling as the devkit's per-frame queries,
@@ -127,8 +129,10 @@ on 16 CPUs, which is why the plan step does it once.
 - Of nuPlan's CLS terms only at-fault collisions and drivable-area compliance are labels; no TTC,
   driving-direction compliance, making-progress or speed-limit terms yet. Collisions with static objects
   count as unsafe (CLS halves the score for the first one).
-- The lateral at-fault test assumes front and rear corners in different lanes are connected (no lane graph
-  in the cache), and the drivable-area ego-lane exemption is not modelled.
+- The drivable-area ego-lane exemption is not modelled, and the model does not yet read the lane graph or
+  the future traffic lights (they are cached for labels and later inputs).
+- Ego input: the ego token sees 2 s of ego history. PlanTF reports that ego history (and unmasked kinematic
+  state) causes shortcut learning in closed loop; an ego-input switch with state dropout is still to come.
 - Log replay is non-reactive (CLS-NR); agents never react to the candidate.
 - Static objects are taken at their t = 0 pose in the scorer's rule features (labels use the full log).
 - Pedestrians and bicycles use Cartesian anchors like vehicles.

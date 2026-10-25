@@ -20,8 +20,9 @@ Targets / labels (read from the logged future)
   ego_future_xy [T,2], ego_future_yaw [T], ego_future_valid [T]   (rear axle)
   fut_xy [L,T,2], fut_yaw [L,T], fut_lw [L,T,2], fut_vel [L,T,2], fut_valid [L,T], fut_static [L]
                                            log-replay boxes of every cached object
-  lane_poly [Lp,2P,2], lane_poly_valid [Lp]  lane / lane-connector polygons (left boundary + reversed right),
-                                           for nuplan's "ego in one or connected lanes" test
+  lane_poly [Lp,2P,2], lane_poly_valid [Lp], lane_succ [Lp,S]
+                                           lane / lane-connector polygons (left boundary + reversed right) and
+                                           successors, for nuplan's "ego in one or connected lanes" test
   edge_xy / edge_dir / edge_prev_dir [E,2], edge_len / edge_prev_len / edge_same_prev / edge_valid [E]
                                            drivable-area boundary points with their outgoing / incoming segments
   tok_edge_xy / tok_edge_dir [Et,2], tok_edge_valid [Et]                       scorer boundary tokens
@@ -126,9 +127,14 @@ def map_arrays(z, cfg: AnchorWMConfig) -> tuple[np.ndarray, np.ndarray]:
 
 
 def lane_polygons(z, cfg: AnchorWMConfig) -> dict:
+    """Polygons of the first max_lanes lanes and their successors among them (-1 = none)."""
     nl = int(cfg.max_lanes)
     poly = np.concatenate([z["lane_left"][:nl], z["lane_right"][:nl, ::-1]], 1)
-    return {"lane_poly": _pad(poly, nl).astype(np.float32), "lane_poly_valid": np.arange(nl) < len(poly)}
+    succ = z["lane_succ"][:nl].astype(np.int64)
+    lane_succ = np.full((nl, z["lane_succ"].shape[1]), -1, np.int64)
+    lane_succ[:len(succ)] = np.where(succ < nl, succ, -1)
+    return {"lane_poly": _pad(poly, nl).astype(np.float32), "lane_poly_valid": np.arange(nl) < len(poly),
+            "lane_succ": lane_succ}
 
 
 def edge_arrays(z, cfg: AnchorWMConfig) -> dict:

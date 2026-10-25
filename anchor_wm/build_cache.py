@@ -10,16 +10,21 @@ The time grid is 0.1 s: PAST_FRAMES = 21 frames up to and including t = 0, then 
               acceleration rotated into the t = 0 frame)
   objects     every tracked object (vehicle / pedestrian / bicycle / czone sign / barrier / traffic cone /
               generic object) seen within --object_radius of the ego at t = 0 in any of the 101 frames,
-              nearest first (at most --max_objects): obj_pose [N,101,3] (box centre), obj_vel [N,101,2],
+              nearest first (at most --max_objects): obj_pose [N,101,3] (box centre), obj_vel [N,101,2] (float16),
               obj_valid [N,101], obj_lw [N,2] (length, width), obj_type [N] (config.OBJ_TYPES index).
               Missing frames are invalid (no padding), objects that only appear later are included.
   lanes       lanes + lane connectors within --map_radius, nearest first: lane_xy / lane_left / lane_right
               [L,20,2] (centreline and boundaries, each resampled to 20 points), lane_type [L] (0 lane,
-              1 connector), lane_on_route [L], lane_tl [L] (config.TL_STATES index), lane_speed_limit [L]
-              (m/s), lane_has_speed_limit [L]
-  polygons    crosswalks and stop lines: poly_xy [P,20,2] (exterior ring), poly_type [P] (0 crosswalk, 1 stop line)
-  route       route_xy [R,2]: centreline of the lane path along the (corrected) route roadblocks, 1 m apart,
-              from 30 m behind the ego's projection on it; empty when no route lane is found near the ego
+              1 connector), lane_on_route [L], lane_tl [L] (config.TL_STATES index at t = 0), lane_tl_future
+              [L,17] (t = 0, 0.5, ..., 8 s), lane_speed_limit [L] (m/s), lane_has_speed_limit [L], lane_id /
+              lane_roadblock_id [L] (map ids), lane topology as indices into these lanes (-1 = none / not cached):
+              lane_succ / lane_pred [L,6], lane_left_nbr / lane_right_nbr [L] (the devkit's outgoing / incoming
+              / adjacent edges)
+  polygons    crosswalks, stop lines, intersections: poly_xy [P,20,2] (exterior ring), poly_type [P]
+              (0 crosswalk, 1 stop line, 2 intersection)
+  route       route_roadblock_ids [K] (corrected route), route_xy [R,2]: centreline of the lane path along the
+              route roadblocks, 1 m apart, from 30 m behind the ego's projection on it; empty when no route lane
+              is found near the ego
   goal        goal_pose [3], goal_valid (mission goal: the scene's goal ego pose, as scenario.get_mission_goal)
   drivable    da_xy / da_dir / da_prev_dir [E,2], da_len / da_prev_len [E]: boundary of the union of the
               DRIVABLE_AREA layer (what nuplan's drivable_area_compliance uses) within --da_radius: the ring
@@ -96,6 +101,9 @@ DB_ROW_INTERVAL = 0.05
 FRAME_OFFSETS = np.array(
     [-i for i in sample_indices_with_time_horizon(PAST_FRAMES - 1, (PAST_FRAMES - 1) * CACHE_DT, DB_ROW_INTERVAL)][::-1]
     + [0] + sample_indices_with_time_horizon(FUTURE_FRAMES, FUTURE_FRAMES * CACHE_DT, DB_ROW_INTERVAL))
+# Traffic-light states are kept at t = 0 and every 0.5 s of the future (lidar-row offsets).
+TL_OFFSETS = np.arange(0, FUTURE_FRAMES * 2 + 1, 10)
+MAX_LANE_EDGES = 6                      # successors / predecessors kept per lane
 CATEGORY_INDEX = {name: OBJ_TYPE_INDEX.get(TrackedObjectType[local2agent_type[raw_mapping["global2local"][name]]], -1)
                   for name in raw_mapping["global2local"]}
 AGENT_INDICES = {OBJ_TYPE_INDEX[t] for t in AGENT_TYPES if t in OBJ_TYPE_INDEX}
@@ -120,10 +128,10 @@ def parse_args() -> argparse.Namespace:
                    help="restart workers after this many logs (bounds the devkit's map-object cache)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--object_radius", type=float, default=120.0)
-    p.add_argument("--max_objects", type=int, default=256)
-    p.add_argument("--map_radius", type=float, default=100.0)
-    p.add_argument("--max_lanes", type=int, default=128)
-    p.add_argument("--max_polygons", type=int, default=48)
+    p.add_argument("--max_objects", type=int, default=192)
+    p.add_argument("--map_radius", type=float, default=120.0)
+    p.add_argument("--max_lanes", type=int, default=256)
+    p.add_argument("--max_polygons", type=int, default=64)
     p.add_argument("--da_radius", type=float, default=150.0)
     p.add_argument("--max_da_points", type=int, default=8192)
     p.add_argument("--route_length_m", type=float, default=400.0)
@@ -198,7 +206,8 @@ class LogData:
             self.goal = [None if r[12] is None else (r[12], r[13], _yaw(*r[14:18])) for r in rows]
             starts = [self.index[t] for t in tokens if t in self.index]
             frames = sorted({int(i) for i0 in starts for i in i0 + FRAME_OFFSETS if 0 <= i < len(rows)})
-            self.tl = {i: {} for i in starts}
+            self.tl = {int(i): {} for i0 in starts for i in i0 + TL_OFFSETS if i < len(rows)}
+            frames = sorted(set(frames) | set(self.tl))
             self.boxes = {i: [] for i in frames}
             for chunk in range(0, len(frames), 500):
                 ids = frames[chunk:chunk + 500]
@@ -276,8 +285,37 @@ def object_arrays(log: LogData, idx: np.ndarray, origin: np.ndarray, radius: flo
     return {k: np.stack(v) if k != "obj_type" else np.array(v, np.int8) for k, v in out.items()}
 
 
+_GRAPHS: dict = {}
+
+
+def lane_graph(map_api) -> dict:
+    """Lane-graph edges of a whole map, from its lane / lane-connector tables (once per worker and map), with
+    the devkit's rules: a lane's outgoing edges are the connectors whose exit_lane_fid is the lane, a
+    connector leads into its entry_lane_fid; neighbours are lanes of the same lane group with lane_index -+ 1
+    (smaller index on the left). Keys are (kind, id) with kind 0 lane / 1 connector."""
+    name = map_api.map_name
+    if name not in _GRAPHS:
+        lanes = map_api._get_vector_map_layer(SemanticMapLayer.LANE)
+        conns = map_api._get_vector_map_layer(SemanticMapLayer.LANE_CONNECTOR)
+        succ: dict = {}
+        pred: dict = {}
+        for fid, exit_lane, entry_lane in zip(conns["fid"].astype(str), conns["exit_lane_fid"].astype(str),
+                                              conns["entry_lane_fid"].astype(str)):
+            succ.setdefault((0, exit_lane), []).append((1, fid))
+            pred.setdefault((0, entry_lane), []).append((1, fid))
+            succ[(1, fid)] = [(0, entry_lane)]
+            pred[(1, fid)] = [(0, exit_lane)]
+        slot = {(str(g), int(i)): str(f) for f, g, i in zip(lanes["fid"], lanes["lane_group_fid"], lanes["lane_index"])}
+        left = {(0, f): (0, slot[(str(g), int(i) - 1)]) for f, g, i in zip(lanes["fid"].astype(str), lanes["lane_group_fid"],
+                                                                         lanes["lane_index"]) if (str(g), int(i) - 1) in slot}
+        right = {(0, f): (0, slot[(str(g), int(i) + 1)]) for f, g, i in zip(lanes["fid"].astype(str), lanes["lane_group_fid"],
+                                                                          lanes["lane_index"]) if (str(g), int(i) + 1) in slot}
+        _GRAPHS[name] = {"succ": succ, "pred": pred, "left": left, "right": right}
+    return _GRAPHS[name]
+
+
 def lane_arrays(map_api, point: Point2D, origin: np.ndarray, radius: float, max_lanes: int,
-                route_ids: set, traffic_lights: dict) -> dict:
+                route_ids: set, traffic_lights: list) -> dict:
     layers = map_api.get_proximal_map_objects(point, radius, [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR])
     rows = []
     for layer, kind in ((SemanticMapLayer.LANE, 0), (SemanticMapLayer.LANE_CONNECTOR, 1)):
@@ -292,8 +330,14 @@ def lane_arrays(map_api, point: Point2D, origin: np.ndarray, radius: float, max_
     n = len(rows)
     out = {"lane_xy": np.zeros((n, MAP_POINTS, 2)), "lane_left": np.zeros((n, MAP_POINTS, 2)),
            "lane_right": np.zeros((n, MAP_POINTS, 2)), "lane_type": np.zeros(n, np.int8),
-           "lane_on_route": np.zeros(n, bool), "lane_tl": np.full(n, TL_INDEX["UNKNOWN"], np.int8),
-           "lane_speed_limit": np.zeros(n), "lane_has_speed_limit": np.zeros(n, bool)}
+           "lane_on_route": np.zeros(n, bool), "lane_tl_future": np.full((n, len(TL_OFFSETS)), TL_INDEX["UNKNOWN"], np.int8),
+           "lane_speed_limit": np.zeros(n), "lane_has_speed_limit": np.zeros(n, bool),
+           "lane_id": np.array([str(r[2].id) for r in rows], dtype=str),
+           "lane_roadblock_id": np.array([str(r[2].get_roadblock_id()) for r in rows], dtype=str),
+           "lane_succ": np.full((n, MAX_LANE_EDGES), -1, np.int16), "lane_pred": np.full((n, MAX_LANE_EDGES), -1, np.int16),
+           "lane_left_nbr": np.full(n, -1, np.int16), "lane_right_nbr": np.full(n, -1, np.int16)}
+    graph = lane_graph(map_api)
+    slot = {(r[1], str(r[2].id)): i for i, r in enumerate(rows)}
     for i, (_, kind, obj, center) in enumerate(rows):
         c = resample(center, MAP_POINTS)
         out["lane_xy"][i] = to_local(c, origin)
@@ -304,17 +348,25 @@ def lane_arrays(map_api, point: Point2D, origin: np.ndarray, radius: float, max_
             out[key][i] = to_local(b, origin)
         out["lane_type"][i] = kind
         out["lane_on_route"][i] = obj.get_roadblock_id() in route_ids
-        out["lane_tl"][i] = traffic_lights.get(str(obj.id), TL_INDEX["UNKNOWN"])
+        out["lane_tl_future"][i] = [tl.get(str(obj.id), TL_INDEX["UNKNOWN"]) for tl in traffic_lights]
+        key = (kind, str(obj.id))
+        for name in ("succ", "pred"):
+            nbrs = [slot[e] for e in graph[name].get(key, []) if e in slot][:MAX_LANE_EDGES]
+            out[f"lane_{name}"][i, :len(nbrs)] = nbrs
+        for name in ("left", "right"):
+            out[f"lane_{name}_nbr"][i] = slot.get(graph[name].get(key), -1)
         if obj.speed_limit_mps is not None:
             out["lane_speed_limit"][i], out["lane_has_speed_limit"][i] = obj.speed_limit_mps, True
+    out["lane_tl"] = out["lane_tl_future"][:, 0].copy()
     return out
 
 
 def polygon_arrays(map_api, point: Point2D, origin: np.ndarray, radius: float, max_polygons: int) -> dict:
-    layers = map_api.get_proximal_map_objects(point, radius, [SemanticMapLayer.CROSSWALK, SemanticMapLayer.STOP_LINE])
+    kinds = ((SemanticMapLayer.CROSSWALK, 0), (SemanticMapLayer.STOP_LINE, 1), (SemanticMapLayer.INTERSECTION, 2))
+    layers = map_api.get_proximal_map_objects(point, radius, [k for k, _ in kinds])
     ego = shapely.Point(origin[0], origin[1])
     rows = []
-    for layer, kind in ((SemanticMapLayer.CROSSWALK, 0), (SemanticMapLayer.STOP_LINE, 1)):
+    for layer, kind in kinds:
         for obj in layers[layer]:
             poly = obj.polygon
             rows.append((poly.distance(ego), kind, np.asarray(poly.exterior.coords)[:-1]))
@@ -435,13 +487,17 @@ def process_scenario(scenario, log: LogData, args) -> dict | None:
             "goal_pose": goal_pose, "goal_valid": np.bool_(goal is not None)}
     data.update(ego_arrays(log, idx, origin))
     data.update(object_arrays(log, idx, origin, args.object_radius, args.max_objects))
-    tls = log.tl[i0]
+    tls = [log.tl[int(i0 + o)] for o in TL_OFFSETS]
     data.update(lane_arrays(map_api, point, origin, args.map_radius, args.max_lanes, set(route_ids), tls))
     data.update(polygon_arrays(map_api, point, origin, args.map_radius, args.max_polygons))
     data["route_xy"] = route_centerline(map_api, point, origin, route_ids, args.route_length_m)
+    data["route_roadblock_ids"] = np.array(route_ids, dtype=str)
     data.update(drivable_area_arrays(map_api, origin, args.da_radius, args.max_da_points))
-    return {k: v.astype(np.float32) if isinstance(v, np.ndarray) and v.dtype == np.float64 and k != "origin_pose" else v
+    # float32 everywhere (origin_pose float64); object velocities float16 (0.01 m/s), the largest array after poses.
+    data = {k: v.astype(np.float32) if isinstance(v, np.ndarray) and v.dtype == np.float64 and k != "origin_pose" else v
             for k, v in data.items()}
+    data["obj_vel"] = data["obj_vel"].astype(np.float16)
+    return data
 
 
 def cache_file(save_path: str, scenario) -> str:

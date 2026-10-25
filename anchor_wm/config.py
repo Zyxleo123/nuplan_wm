@@ -9,7 +9,7 @@ DYNAMIC_TYPES = (0, 1, 2)
 # Anchor sets are per group; the ego uses the vehicle set.
 ANCHOR_GROUPS = ("vehicle", "pedestrian", "bicycle")
 # Map polyline types (`map_type` one-hot): lanes / lane connectors from the lane layers, then polygons.
-MAP_TYPES = ("lane", "lane_connector", "crosswalk", "stop_line")
+MAP_TYPES = ("lane", "lane_connector", "crosswalk", "stop_line", "intersection")
 TL_STATES = ("green", "yellow", "red", "unknown")
 SUB_SCORES = ("overlap", "offroad", "progress", "comfort")
 # nuplan drivable_area_compliance: a corner is a violation only this far (m) outside the drivable area.

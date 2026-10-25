@@ -182,7 +182,7 @@ def validate(model, val_batches, args, cfg, device, amp, scale) -> dict:
     g = torch.Generator().manual_seed(1234)
     for batch in val_batches:
         f = move(batch, device)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
             enc, dec = model(f)
             dec = {k: v.float() for k, v in dec.items()}
             _, m = wm_loss(dec, f, cfg)
@@ -279,7 +279,7 @@ def main() -> None:
         for grp, base in zip(opt.param_groups, base_lrs):
             grp["lr"] = base * lr_mult
         scale = joint_scale(args, step)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
             enc, dec = model(f)
             dec = {k: v.float() for k, v in dec.items()}
             loss, metrics = wm_loss(dec, f, cfg)
