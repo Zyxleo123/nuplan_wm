@@ -73,11 +73,32 @@ Train on a subset of the cache with `--file_list subset.json` (a JSON list of ca
 | `goal_pose / goal_valid` | mission goal (only used with `--use_goal`) |
 | `log_name`, `scenario_type` | log-level train / val split; subsets |
 
-The time grid is 0.1 s (21 past frames incl. t = 0, 80 future frames), which the model uses as is
+The per-key shapes, dtypes and frames are listed in the `build_cache.py` docstring. The time grid is 0.1 s
+(21 past frames incl. t = 0, 80 future frames), which the model uses as is
 (`history_stride` / `future_stride` in `config.py` subsample it).
 Files are named `<log_name>__<token>.npz` so the split needs no file reads. A scenario takes about
-500 KB (330 KB on babel's compressed /data/user_data), so the 1M-scenario training set is about 330 GB there;
-object arrays dominate, so objects are capped at the 192 the labels use and their velocities are float16.
+500 KB (360 KB on babel's compressed /data/user_data); object arrays dominate, so objects are capped at the
+192 the labels use and their velocities are float16.
+
+### Built cache (babel)
+
+| | |
+|---|---|
+| Path | `/data/user_data/ishanj/anchor_wm_nuplan/cache` (plan: `.../anchor_wm_nuplan/cache/plan.json`) |
+| Source | nuPlan v1.1 trainval DBs + maps under `/data/datasets/nuPlan-v1.1`, nuplan-devkit e924167 |
+| Scenarios | 1,004,587 from 9,722 logs: exactly Diffusion-Planner's `diffusion_planner_training.json` (every token found) |
+| Size | 363 GB |
+| Build | 2026-10-25, code at `63040c3`: 4 array tasks x 16 CPUs (preempt CPU QoS), ~2.5 h each, 0.035-0.038 s / scenario |
+| Access | group `jeff4_group` (read + write; nothing outside the group) |
+
+34 scenarios first failed on the empty-object case fixed in `63040c3` (objects in the log, none within
+120 m) and were rebuilt by a second pass of the same array, which only fills missing files. A preempted
+task leaves `*.npz.tmp.*` files (writes are atomic renames); they are safe to delete.
+
+The cache does not hold Diffusion-Planner's fixed tensors (`neighbor_agents_past [32,21,11]`,
+`lanes [70,20,12]`, `route_lanes [25,20,12]`, ...), but it holds everything they are built from (a
+superset: 120 m vs 100 m, 192 objects vs 32 + 5, 256 lanes vs 70, the same 20-point lanes and 0.1 s
+frames), so an adapter could derive them at load time rather than building a second cache.
 
 Building it reads each log once: every scenario's 101 frames come from one pass over the log's lidar
 frames / ego poses / boxes (`LogData`, the same rows and frame sampling as the devkit's per-frame queries,
