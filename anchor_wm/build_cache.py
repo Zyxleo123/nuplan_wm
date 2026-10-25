@@ -265,9 +265,10 @@ def object_arrays(log: LogData, idx: np.ndarray, origin: np.ndarray, radius: flo
                 tr["vel"][t] = (vx, vy)
             tr["lw"][t] = (length, width)
             tr["valid"][t] = True
+    empty = {"obj_pose": np.zeros((0, NUM_FRAMES, 3)), "obj_vel": np.zeros((0, NUM_FRAMES, 2)),
+             "obj_valid": np.zeros((0, NUM_FRAMES), bool), "obj_lw": np.zeros((0, 2)), "obj_type": np.zeros(0, np.int8)}
     if not tracks:
-        return {"obj_pose": np.zeros((0, NUM_FRAMES, 3)), "obj_vel": np.zeros((0, NUM_FRAMES, 2)),
-                "obj_valid": np.zeros((0, NUM_FRAMES), bool), "obj_lw": np.zeros((0, 2)), "obj_type": np.zeros(0, np.int8)}
+        return empty
     trs = list(tracks.values())
     pose = np.stack([t["pose"] for t in trs])
     valid = np.stack([t["valid"] for t in trs])
@@ -275,6 +276,8 @@ def object_arrays(log: LogData, idx: np.ndarray, origin: np.ndarray, radius: flo
     dist = np.where(valid, np.linalg.norm(local, axis=-1), np.inf).min(1)
     order = np.argsort(dist, kind="stable")
     order = order[dist[order] <= radius][:max_objects]
+    if len(order) == 0:                     # objects in the log, none within radius of the ego
+        return empty
     now = PAST_FRAMES - 1
     out = {"obj_pose": [], "obj_vel": [], "obj_valid": [], "obj_lw": [], "obj_type": []}
     for i in order:
