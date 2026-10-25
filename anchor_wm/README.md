@@ -30,15 +30,22 @@ ego candidates [C,T] ──► scorer: GRU + cross-attention to scene tokens + t
 | `model.py` | encoder, anchor decoder, `PlanScorer` |
 | `losses.py` | `wm_loss`, `score_loss` (current), `simple_score_loss` (simple) |
 | `train.py` | training loop (bf16 autocast, joint-gradient ramp, non-finite step skipping, profiling, wandb) |
-| `slurm/` | babel scripts: `env.sh` (paths), `cache.sh` (cache array job), `train.sh` (anchors if missing + one run) |
+| `slurm/` | babel scripts: `env.sh` (paths), `cache.sh` (cache: plan + sharded build), `train.sh` (anchors if missing + one run) |
 
 ## Running (babel)
 
+Submit from the repo root. `slurm/env.sh` defaults to the conda env `nuplan_wm`, output under
+`/data/user_data/$USER/anchor_wm_nuplan` and logs in `logs/`; override any of them from the environment
+(e.g. `CONDA_ENV=nuplan_wm_ishan`).
+
 ```bash
-# 1. cache: smoke-sized, or the full trainval split as a 20-shard array job
-CACHE_DIR=/data/user_data/mineuih/ishan/anchor_wm_nuplan/cache_smoke \
+# 1. cache. Smoke-sized (lists and builds in one job):
+STEP=direct CACHE_DIR=/data/user_data/$USER/anchor_wm_nuplan/cache_smoke \
   EXTRA_ARGS="--max_db_files 12 --total_scenarios 300" sbatch anchor_wm/slurm/cache.sh
-sbatch --array=0-19 anchor_wm/slurm/cache.sh
+# Full: list once (same 1M-scenario filter / seed as data_process.py), then build in shards. Listing reads
+# every log, so the shards don't repeat it; each opens only its own logs and skips files that exist.
+plan=$(STEP=plan TOTAL=1000000 sbatch --parsable --cpus-per-task=32 anchor_wm/slurm/cache.sh)
+sbatch --array=0-7 --dependency=afterok:${plan} anchor_wm/slurm/cache.sh
 
 # 2. anchors (train.sh fits them when ANCHORS is missing) + training
 sbatch anchor_wm/slurm/train.sh                          # joint, current loss
@@ -66,8 +73,16 @@ Train on a subset of the cache with `--file_list subset.json` (a JSON list of ca
 
 The time grid is 0.1 s (21 past frames incl. t = 0, 80 future frames), which the model uses as is
 (`history_stride` / `future_stride` in `config.py` subsample it).
-Files are named `<log_name>__<token>.npz` so the split needs no file reads. The smoke cache (300
-scenarios) is about 320 KB per scenario, so the full ~600k-scenario cache is about 190 GB.
+Files are named `<log_name>__<token>.npz` so the split needs no file reads. A scenario takes about
+300 KB, so the 1M-scenario training set is about 300 GB.
+
+Building it reads each log once: every scenario's 101 frames come from one pass over the log's lidar
+frames / ego poses / boxes (`LogData`, the same rows and frame sampling as the devkit's per-frame queries,
+which take ~105 queries per scenario), after a sequential copy of the `.db` from NFS to node-local disk.
+On the smoke set this gives byte-identical files at 0.084 s / scenario on 8 CPUs (0.33 s with the devkit's
+queries); a cold 100 MB log with 76 scenarios takes 4.7 s to copy, 0.9 s to read and 0.16 s per scenario
+for the map / route / drivable-area work. Listing all 13,180 training logs (54.8M scenarios) takes ~19 min
+on 16 CPUs, which is why the plan step does it once.
 
 ## Design differences: nuPlan vs WOMD
 

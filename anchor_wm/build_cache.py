@@ -20,15 +20,24 @@ The time grid is 0.1 s: PAST_FRAMES = 21 frames up to and including t = 0, then 
   polygons    crosswalks and stop lines: poly_xy [P,20,2] (exterior ring), poly_type [P] (0 crosswalk, 1 stop line)
   route       route_xy [R,2]: centreline of the lane path along the (corrected) route roadblocks, 1 m apart,
               from 30 m behind the ego's projection on it; empty when no route lane is found near the ego
-  goal        goal_pose [3], goal_valid (mission goal, scenario.get_mission_goal)
+  goal        goal_pose [3], goal_valid (mission goal: the scene's goal ego pose, as scenario.get_mission_goal)
   drivable    da_xy / da_dir / da_prev_dir [E,2], da_len / da_prev_len [E]: boundary of the union of the
               DRIVABLE_AREA layer (what nuplan's drivable_area_compliance uses) within --da_radius: the ring
               vertices plus points at most 1 m apart, each with its outgoing / incoming segment. Rings are
               oriented so the drivable side is on the left of `da_dir`, which gives the Waymax-style sign
               (> 0 offroad) with every point's predecessor on the same ring.
 
+Small caches list and build in one go:
+
   python -m anchor_wm.build_cache --data_path .../nuplan-v1.1/splits/trainval --map_path .../maps \
-      --save_path .../anchor_wm_cache --total_scenarios 1000000 --num_workers 32
+      --save_path .../cache_smoke --max_db_files 12 --total_scenarios 300
+
+Large caches plan once, then build in shards (slurm/cache.sh): listing scenarios reads every log, so it
+is done once (`--make_plan` writes {log_name: [tokens]}); each shard then opens only its own logs and
+skips scenarios whose file exists, so a preempted shard restarts where it stopped.
+
+  python -m anchor_wm.build_cache ... --total_scenarios 1000000 --plan_file .../plan.json --make_plan
+  python -m anchor_wm.build_cache ... --plan_file .../plan.json --num_shards 8 --shard_id 3
 """
 
 from __future__ import annotations
@@ -42,7 +51,9 @@ import argparse  # noqa: E402
 import glob  # noqa: E402
 import json  # noqa: E402
 import random  # noqa: E402
+import shutil  # noqa: E402
 import socket  # noqa: E402
+import sqlite3  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
 from multiprocessing import Pool  # noqa: E402
@@ -52,12 +63,18 @@ import shapely  # noqa: E402
 from shapely.geometry import Polygon, box  # noqa: E402
 from shapely.ops import orient, unary_union  # noqa: E402
 
-from nuplan.common.actor_state.state_representation import Point2D  # noqa: E402
-from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType  # noqa: E402
+from nuplan.common.actor_state.ego_state import EgoState  # noqa: E402
+from nuplan.common.actor_state.state_representation import Point2D, StateSE2, StateVector2D, TimePoint  # noqa: E402
+from nuplan.common.actor_state.tracked_objects_types import AGENT_TYPES, TrackedObjectType  # noqa: E402
+from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters  # noqa: E402
 from nuplan.common.maps.maps_datatypes import SemanticMapLayer  # noqa: E402
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder  # noqa: E402
 from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter  # noqa: E402
+from nuplan.database.nuplan_db.nuplan_scenario_queries import get_sensor_token  # noqa: E402
+from nuplan.database.utils.label.utils import local2agent_type, raw_mapping  # noqa: E402
+from nuplan.planning.scenario_builder.scenario_utils import sample_indices_with_time_horizon  # noqa: E402
 from nuplan.planning.utils.multithreading.worker_parallel import SingleMachineParallelExecutor  # noqa: E402
+from pyquaternion import Quaternion  # noqa: E402
 
 from anchor_wm.config import CACHE_DT, FUTURE_FRAMES, PAST_FRAMES  # noqa: E402
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction  # noqa: E402
@@ -73,6 +90,15 @@ NUM_FRAMES = PAST_FRAMES + FUTURE_FRAMES
 ROUTE_BEHIND_M = 30.0
 DA_SMOOTH_M = 0.1
 DA_SPACING_M = 1.0
+# Frame offsets (in 20 Hz lidar rows) of the cached frames around t = 0, as the devkit samples them
+# (NuPlanScenario.get_past / get_future_tracked_objects with these horizons and sample counts).
+DB_ROW_INTERVAL = 0.05
+FRAME_OFFSETS = np.array(
+    [-i for i in sample_indices_with_time_horizon(PAST_FRAMES - 1, (PAST_FRAMES - 1) * CACHE_DT, DB_ROW_INTERVAL)][::-1]
+    + [0] + sample_indices_with_time_horizon(FUTURE_FRAMES, FUTURE_FRAMES * CACHE_DT, DB_ROW_INTERVAL))
+CATEGORY_INDEX = {name: OBJ_TYPE_INDEX.get(TrackedObjectType[local2agent_type[raw_mapping["global2local"][name]]], -1)
+                  for name in raw_mapping["global2local"]}
+AGENT_INDICES = {OBJ_TYPE_INDEX[t] for t in AGENT_TYPES if t in OBJ_TYPE_INDEX}
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,7 +114,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=len(os.sched_getaffinity(0)))
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--shard_id", type=int, default=0)
-    p.add_argument("--max_tasks_per_child", type=int, default=200)
+    p.add_argument("--plan_file", default="", help="scenario plan: written with --make_plan, read by the shards")
+    p.add_argument("--make_plan", action="store_true", help="list the scenarios, write --plan_file and exit")
+    p.add_argument("--max_tasks_per_child", type=int, default=20,
+                   help="restart workers after this many logs (bounds the devkit's map-object cache)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--object_radius", type=float, default=120.0)
     p.add_argument("--max_objects", type=int, default=256)
@@ -138,47 +167,89 @@ def path_xy(path) -> np.ndarray:
 
 # ---- per-scenario extraction -----------------------------------------------------------------
 
-def ego_arrays(scenario, origin: np.ndarray) -> dict | None:
-    past = list(scenario.get_ego_past_trajectory(iteration=0, num_samples=PAST_FRAMES - 1,
-                                                 time_horizon=(PAST_FRAMES - 1) * CACHE_DT))
-    future = list(scenario.get_ego_future_trajectory(iteration=0, num_samples=FUTURE_FRAMES,
-                                                     time_horizon=FUTURE_FRAMES * CACHE_DT))
-    if len(past) != PAST_FRAMES - 1 or len(future) != FUTURE_FRAMES:
-        return None
-    states = past + [scenario.initial_ego_state] + future
-    pose = np.array([[s.rear_axle.x, s.rear_axle.y, s.rear_axle.heading] for s in states])
-    vel_body = np.array([[s.dynamic_car_state.rear_axle_velocity_2d.x, s.dynamic_car_state.rear_axle_velocity_2d.y]
-                         for s in states])
-    acc_body = np.array([[s.dynamic_car_state.rear_axle_acceleration_2d.x,
-                          s.dynamic_car_state.rear_axle_acceleration_2d.y] for s in states])
+def _yaw(qw, qx, qy, qz) -> float:
+    return Quaternion(qw, qx, qy, qz).yaw_pitch_roll[0]          # as the devkit's queries convert ego poses
+
+
+class LogData:
+    """One log read with a few queries instead of the devkit's ~105 per scenario: every lidar frame of the
+    merged point cloud in timestamp order (the order get_sampled_lidarpcs_from_db samples in) with its ego
+    pose and the scene's mission goal, then the traffic lights at the scenarios' t = 0 frames and the boxes of
+    every frame the scenarios need. Rows and conversions match the devkit's (nuplan_scenario_queries)."""
+
+    def __init__(self, db_file: str, tokens: list) -> None:
+        sensor = bytearray.fromhex(get_sensor_token(db_file, "lidar", "MergedPointCloud"))
+        con = sqlite3.connect(db_file)
+        try:
+            rows = con.execute("""
+                SELECT lp.token, lp.timestamp, ep.x, ep.y, ep.qw, ep.qx, ep.qy, ep.qz, ep.vx, ep.vy,
+                       ep.acceleration_x, ep.acceleration_y, gp.x, gp.y, gp.qw, gp.qx, gp.qy, gp.qz
+                FROM lidar_pc AS lp
+                LEFT JOIN ego_pose AS ep ON ep.token = lp.ego_pose_token
+                LEFT JOIN scene AS s ON s.token = lp.scene_token
+                LEFT JOIN ego_pose AS gp ON gp.token = s.goal_ego_pose_token
+                WHERE lp.lidar_token = ?
+                ORDER BY lp.timestamp ASC""", (sensor,)).fetchall()
+            self.index = {r[0].hex(): i for i, r in enumerate(rows)}
+            self.timestamp = np.array([r[1] for r in rows], np.int64)
+            self.pose = np.array([(r[2], r[3], _yaw(*r[4:8])) for r in rows], np.float64)
+            self.vel = np.array([r[8:10] for r in rows], np.float64)
+            self.acc = np.array([r[10:12] for r in rows], np.float64)
+            self.goal = [None if r[12] is None else (r[12], r[13], _yaw(*r[14:18])) for r in rows]
+            starts = [self.index[t] for t in tokens if t in self.index]
+            frames = sorted({int(i) for i0 in starts for i in i0 + FRAME_OFFSETS if 0 <= i < len(rows)})
+            self.tl = {i: {} for i in starts}
+            self.boxes = {i: [] for i in frames}
+            for chunk in range(0, len(frames), 500):
+                ids = frames[chunk:chunk + 500]
+                tok = [bytearray(rows[i][0]) for i in ids]
+                marks = ",".join("?" * len(ids))
+                at = {rows[i][0]: i for i in ids}
+                for r in con.execute(f"""
+                        SELECT lb.lidar_pc_token, c.name, lb.x, lb.y, lb.yaw, lb.length, lb.width, lb.vx, lb.vy, lb.track_token
+                        FROM lidar_box AS lb
+                        INNER JOIN track AS t ON t.token = lb.track_token
+                        INNER JOIN category AS c ON c.token = t.category_token
+                        WHERE lb.lidar_pc_token IN ({marks})""", tok):
+                    self.boxes[at[r[0]]].append(r[1:])
+                for r in con.execute(f"""
+                        SELECT lidar_pc_token, status, lane_connector_id FROM traffic_light_status
+                        WHERE lidar_pc_token IN ({marks})""", tok):
+                    i = at[r[0]]
+                    if i in self.tl:
+                        self.tl[i][str(r[2])] = TL_INDEX.get(str(r[1]).upper(), TL_INDEX["UNKNOWN"])
+        finally:
+            con.close()
+
+    def ego_state(self, i: int) -> EgoState:
+        return EgoState.build_from_rear_axle(
+            StateSE2(*self.pose[i]), tire_steering_angle=0.0, vehicle_parameters=get_pacifica_parameters(),
+            time_point=TimePoint(int(self.timestamp[i])), rear_axle_velocity_2d=StateVector2D(*self.vel[i]),
+            rear_axle_acceleration_2d=StateVector2D(*self.acc[i]))
+
+
+def ego_arrays(log: LogData, idx: np.ndarray, origin: np.ndarray) -> dict:
+    pose = log.pose[idx]
     rel = wrap(pose[:, 2] - origin[2])
     return {"ego_pose": np.concatenate([to_local(pose[:, :2], origin), rel[:, None]], -1),
-            "ego_vel": rotate_to_local(vel_body, -rel), "ego_acc": rotate_to_local(acc_body, -rel)}
+            "ego_vel": rotate_to_local(log.vel[idx], -rel), "ego_acc": rotate_to_local(log.acc[idx], -rel)}
 
 
-def object_arrays(scenario, origin: np.ndarray, radius: float, max_objects: int) -> dict:
-    past = [d.tracked_objects for d in scenario.get_past_tracked_objects(
-        iteration=0, time_horizon=(PAST_FRAMES - 1) * CACHE_DT, num_samples=PAST_FRAMES - 1)]
-    future = [d.tracked_objects for d in scenario.get_future_tracked_objects(
-        iteration=0, time_horizon=FUTURE_FRAMES * CACHE_DT, num_samples=FUTURE_FRAMES)]
-    frames = past + [scenario.initial_tracked_objects.tracked_objects] + future
-    if len(frames) != NUM_FRAMES:
-        raise ValueError(f"expected {NUM_FRAMES} frames of tracked objects, got {len(frames)}")
-    tracks: dict[str, dict] = {}
-    for t, objs in enumerate(frames):
-        for o in objs.tracked_objects:
-            ty = OBJ_TYPE_INDEX.get(o.tracked_object_type)
-            if ty is None:
+def object_arrays(log: LogData, idx: np.ndarray, origin: np.ndarray, radius: float, max_objects: int) -> dict:
+    tracks: dict[bytes, dict] = {}
+    for t, i in enumerate(idx):
+        for name, x, y, yaw, length, width, vx, vy, track in log.boxes[int(i)]:
+            ty = CATEGORY_INDEX.get(name, -1)
+            if ty < 0:
                 continue
-            tr = tracks.get(o.track_token)
+            tr = tracks.get(track)
             if tr is None:
-                tr = tracks[o.track_token] = {"type": ty, "pose": np.zeros((NUM_FRAMES, 3)), "vel": np.zeros((NUM_FRAMES, 2)),
-                                              "lw": np.zeros((NUM_FRAMES, 2)), "valid": np.zeros(NUM_FRAMES, bool)}
-            tr["pose"][t] = (o.center.x, o.center.y, o.center.heading)
-            v = getattr(o, "velocity", None)
-            if v is not None and np.isfinite(v.x) and np.isfinite(v.y):
-                tr["vel"][t] = (v.x, v.y)
-            tr["lw"][t] = (o.box.length, o.box.width)
+                tr = tracks[track] = {"type": ty, "pose": np.zeros((NUM_FRAMES, 3)), "vel": np.zeros((NUM_FRAMES, 2)),
+                                      "lw": np.zeros((NUM_FRAMES, 2)), "valid": np.zeros(NUM_FRAMES, bool)}
+            tr["pose"][t] = (x, y, yaw)
+            if ty in AGENT_INDICES and vx is not None and vy is not None and np.isfinite(vx) and np.isfinite(vy):
+                tr["vel"][t] = (vx, vy)
+            tr["lw"][t] = (length, width)
             tr["valid"][t] = True
     if not tracks:
         return {"obj_pose": np.zeros((0, NUM_FRAMES, 3)), "obj_vel": np.zeros((0, NUM_FRAMES, 2)),
@@ -340,31 +411,31 @@ def drivable_area_arrays(map_api, origin: np.ndarray, radius: float, max_points:
     return out
 
 
-def process_scenario(scenario, args) -> dict:
-    ego0 = scenario.initial_ego_state
-    origin = np.array([ego0.rear_axle.x, ego0.rear_axle.y, ego0.rear_axle.heading], dtype=np.float64)
-    point = Point2D(origin[0], origin[1])
-    ego = ego_arrays(scenario, origin)
-    if ego is None:
+def process_scenario(scenario, log: LogData, args) -> dict | None:
+    """None when the log has no full 2 s past / 8 s future around the scenario."""
+    i0 = log.index[scenario.token]
+    idx = i0 + FRAME_OFFSETS
+    if idx[0] < 0 or idx[-1] >= len(log.timestamp):
         return None
+    origin = log.pose[i0].copy()
+    point = Point2D(origin[0], origin[1])
     map_api = scenario.map_api
     route_ids = scenario.get_route_roadblock_ids()
     if route_ids != [""]:
-        route_ids = route_roadblock_correction(ego0, map_api, route_ids)
+        route_ids = route_roadblock_correction(log.ego_state(i0), map_api, route_ids)
     route_ids = [r for r in route_ids if r]
-    tls = {str(t.lane_connector_id): TL_INDEX.get(t.status.name, TL_INDEX["UNKNOWN"])
-           for t in scenario.get_traffic_light_status_at_iteration(0)}
-    goal = scenario.get_mission_goal()
+    goal = log.goal[i0]
     goal_pose = np.zeros(3)
     if goal is not None:
-        goal_pose = np.concatenate([to_local(np.array([goal.x, goal.y]), origin), [wrap(goal.heading - origin[2])]])
+        goal_pose = np.concatenate([to_local(np.array(goal[:2]), origin), [wrap(goal[2] - origin[2])]])
 
-    data = {"log_name": scenario.log_name, "token": scenario.token, "map_name": scenario.map_api.map_name,
-            "scenario_type": scenario.scenario_type, "timestamp_us": np.int64(scenario.start_time.time_us),
+    data = {"log_name": scenario.log_name, "token": scenario.token, "map_name": map_api.map_name,
+            "scenario_type": scenario.scenario_type, "timestamp_us": np.int64(log.timestamp[i0]),
             "origin_pose": origin.copy(),
             "goal_pose": goal_pose, "goal_valid": np.bool_(goal is not None)}
-    data.update(ego)
-    data.update(object_arrays(scenario, origin, args.object_radius, args.max_objects))
+    data.update(ego_arrays(log, idx, origin))
+    data.update(object_arrays(log, idx, origin, args.object_radius, args.max_objects))
+    tls = log.tl[i0]
     data.update(lane_arrays(map_api, point, origin, args.map_radius, args.max_lanes, set(route_ids), tls))
     data.update(polygon_arrays(map_api, point, origin, args.map_radius, args.max_polygons))
     data["route_xy"] = route_centerline(map_api, point, origin, route_ids, args.route_length_m)
@@ -385,22 +456,72 @@ def _init(args) -> None:
     _ARGS = args
 
 
-def _work(scenario) -> str:
-    path = cache_file(_ARGS.save_path, scenario)
-    if os.path.exists(path):
-        return "exists"
+def _work_log(scenarios: list) -> dict:
+    """All scenarios of one log: read the log once, then write each scenario's file."""
+    counts: dict[str, int] = {}
+    todo = [s for s in scenarios if not os.path.exists(cache_file(_ARGS.save_path, s))]
+    counts["exists"] = len(scenarios) - len(todo)
+    if not todo:
+        return counts
+    # The DBs live on NFS: one sequential copy to node-local disk is several times faster than the random
+    # page reads of the queries (cold 100 MB log: 4.7 s copy + 0.9 s queries). LogData reads all it needs, so
+    # the copy goes right after.
+    local = os.path.join(os.environ.get("TMPDIR") or "/tmp", f"awm_{socket.gethostname()}_{os.getpid()}.db")
     try:
-        data = process_scenario(scenario, _ARGS)
-    except Exception:  # one bad scenario must not stop a long caching run
-        print(f"FAILED {scenario.log_name} {scenario.token}\n{traceback.format_exc()}", flush=True)
-        return "failed"
-    if data is None:
-        return "short"
-    tmp = f"{path}.tmp.{socket.gethostname()}.{os.getpid()}"
-    with open(tmp, "wb") as fh:
-        np.savez(fh, **data)
-    os.replace(tmp, path)
-    return "written"
+        shutil.copyfile(os.path.join(_ARGS.data_path, todo[0].log_name + ".db"), local)
+        log = LogData(local, [s.token for s in todo])
+    except Exception:  # one bad log must not stop a long caching run
+        print(f"FAILED log {todo[0].log_name}\n{traceback.format_exc()}", flush=True)
+        counts["failed"] = len(todo)
+        return counts
+    finally:
+        if os.path.exists(local):
+            os.remove(local)
+    for scenario in todo:
+        try:
+            data = process_scenario(scenario, log, _ARGS)
+        except Exception:
+            print(f"FAILED {scenario.log_name} {scenario.token}\n{traceback.format_exc()}", flush=True)
+            counts["failed"] = counts.get("failed", 0) + 1
+            continue
+        if data is None:
+            counts["short"] = counts.get("short", 0) + 1
+            continue
+        path = cache_file(_ARGS.save_path, scenario)
+        tmp = f"{path}.tmp.{socket.gethostname()}.{os.getpid()}"
+        with open(tmp, "wb") as fh:
+            np.savez(fh, **data)
+        os.replace(tmp, path)
+        counts["written"] = counts.get("written", 0) + 1
+    return counts
+
+
+def scenario_filter(args, log_names: list | None, tokens: list | None = None) -> ScenarioFilter:
+    # Same filter as data_process.py (Diffusion-Planner's training set) when listing; exact tokens when building.
+    planned = tokens is not None
+    return ScenarioFilter(
+        scenario_types=None, scenario_tokens=tokens, log_names=log_names, map_names=None,
+        num_scenarios_per_type=None if planned else args.scenarios_per_type or None,
+        limit_total_scenarios=None if planned else args.total_scenarios or None,
+        timestamp_threshold_s=None, ego_displacement_minimum_m=None, expand_scenarios=True,
+        remove_invalid_goals=False, shuffle=not planned, ego_start_speed_threshold=None, ego_stop_speed_threshold=None,
+        speed_noise_tolerance=None)
+
+
+def list_scenarios(args, db_files: list | None, log_names: list | None, tokens: list | None = None) -> list:
+    builder = NuPlanScenarioBuilder(args.data_path, args.map_path, None, db_files, args.map_version)
+    random.seed(args.seed)
+    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=args.num_workers)
+    return sorted(builder.get_scenarios(scenario_filter(args, log_names, tokens), worker), key=lambda s: (s.log_name, s.token))
+
+
+def shard_logs(plan: dict, num_shards: int, shard_id: int) -> list:
+    """Logs of one shard: greedy balance of the scenario counts, largest logs first (deterministic)."""
+    loads, owner = [0] * num_shards, {}
+    for log in sorted(plan, key=lambda g: (-len(plan[g]), g)):
+        i = loads.index(min(loads))
+        owner[log], loads[i] = i, loads[i] + len(plan[log])
+    return sorted(g for g, i in owner.items() if i == shard_id)
 
 
 def main() -> None:
@@ -411,33 +532,53 @@ def main() -> None:
     if args.log_names_json:
         with open(args.log_names_json) as fh:
             log_names = json.load(fh)
-    db_files = None
-    if args.max_db_files:
-        wanted = set(log_names) if log_names else None
-        db_files = [f for f in sorted(glob.glob(os.path.join(args.data_path, "*.db")))
-                    if wanted is None or os.path.basename(f)[:-3] in wanted][:args.max_db_files]
-    builder = NuPlanScenarioBuilder(args.data_path, args.map_path, None, db_files, args.map_version)
-    scenario_filter = ScenarioFilter(
-        scenario_types=None, scenario_tokens=None, log_names=log_names, map_names=None,
-        num_scenarios_per_type=args.scenarios_per_type or None, limit_total_scenarios=args.total_scenarios or None,
-        timestamp_threshold_s=None, ego_displacement_minimum_m=None, expand_scenarios=True,
-        remove_invalid_goals=False, shuffle=True, ego_start_speed_threshold=None, ego_stop_speed_threshold=None,
-        speed_noise_tolerance=None)
-    random.seed(args.seed)
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=args.num_workers)
-    scenarios = sorted(builder.get_scenarios(scenario_filter, worker), key=lambda s: (s.log_name, s.token))
-    shard = -(-len(scenarios) // args.num_shards)
-    scenarios = scenarios[args.shard_id * shard:(args.shard_id + 1) * shard]
-    print(f"{len(scenarios)} scenarios (shard {args.shard_id}/{args.num_shards})", flush=True)
-    del worker
+    t0 = time.time()
+    if args.plan_file and not args.make_plan:
+        with open(args.plan_file) as fh:
+            plan = json.load(fh)["logs"]
+        logs = shard_logs(plan, args.num_shards, args.shard_id)
+        todo = {g: [t for t in plan[g] if not os.path.exists(os.path.join(args.save_path, f"{g}__{t}.npz"))] for g in logs}
+        todo = {g: t for g, t in todo.items() if t}
+        print(json.dumps({"shard": args.shard_id, "of": args.num_shards, "logs": len(logs),
+                          "scenarios": sum(len(plan[g]) for g in logs), "todo": sum(map(len, todo.values()))}), flush=True)
+        if not todo:
+            return
+        scenarios = list_scenarios(args, [os.path.join(args.data_path, g + ".db") for g in todo], list(todo),
+                                   [t for ts in todo.values() for t in ts])
+    else:
+        db_files = None
+        if args.max_db_files:
+            wanted = set(log_names) if log_names else None
+            db_files = [f for f in sorted(glob.glob(os.path.join(args.data_path, "*.db")))
+                        if wanted is None or os.path.basename(f)[:-3] in wanted][:args.max_db_files]
+        scenarios = list_scenarios(args, db_files, log_names)
+        if args.make_plan:
+            plan = {}
+            for s in scenarios:
+                plan.setdefault(s.log_name, []).append(s.token)
+            with open(args.plan_file, "w") as fh:
+                json.dump({"args": vars(args), "num_scenarios": len(scenarios), "logs": plan}, fh)
+            print(json.dumps({"plan": args.plan_file, "logs": len(plan), "scenarios": len(scenarios),
+                              "list_s": round(time.time() - t0, 1)}), flush=True)
+            return
+        shard = -(-len(scenarios) // args.num_shards)
+        scenarios = scenarios[args.shard_id * shard:(args.shard_id + 1) * shard]
+    print(json.dumps({"scenarios": len(scenarios), "list_s": round(time.time() - t0, 1)}), flush=True)
 
-    t0, counts = time.time(), {}
+    # One task per log (LogData reads it once); largest logs first so the pool's tail is short.
+    groups: dict[str, list] = {}
+    for sc in scenarios:
+        groups.setdefault(sc.log_name, []).append(sc)
+    tasks = sorted(groups.values(), key=len, reverse=True)
+    t0, counts, done = time.time(), {}, 0
     with Pool(args.num_workers, initializer=_init, initargs=(args,), maxtasksperchild=args.max_tasks_per_child) as pool:
-        for i, status in enumerate(pool.imap_unordered(_work, scenarios, chunksize=1)):
-            counts[status] = counts.get(status, 0) + 1
-            if (i + 1) % 500 == 0 or i + 1 == len(scenarios):
-                print(json.dumps({"done": i + 1, "of": len(scenarios), **counts,
-                                  "s_per_scenario": round((time.time() - t0) / (i + 1), 3)}), flush=True)
+        for i, c in enumerate(pool.imap_unordered(_work_log, tasks, chunksize=1)):
+            for k, v in c.items():
+                counts[k] = counts.get(k, 0) + v
+            done += sum(c.values())
+            if (i + 1) % 50 == 0 or i + 1 == len(tasks):
+                print(json.dumps({"logs": i + 1, "of": len(tasks), "scenarios": done, **counts,
+                                  "s_per_scenario": round((time.time() - t0) / max(done, 1), 4)}), flush=True)
 
 
 if __name__ == "__main__":

@@ -6,9 +6,10 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=/home/mineuih/ishan/logs/awm_train_%j.out
+#SBATCH --output=logs/awm_train_%j.out
 #
-# Fit the anchors if ANCHORS does not exist yet, then train one arm.
+# Fit the anchors if ANCHORS does not exist yet, then train one arm. Submit from the repo root (accounts without the
+# general partition: sbatch -p preempt --qos=preempt_qos ...).
 #   SCORER_LOSS=current|simple   scorer loss (default current)
 #   ARM=joint|separate|wm_only   scorer gradients reach the WM / detached / no scorer (default joint)
 #   SMOKE=1                      200 steps, frequent validation, no wandb (inside an allocation: bash anchor_wm/slurm/train.sh)
@@ -17,7 +18,7 @@
 #   SCORER_LOSS=simple sbatch anchor_wm/slurm/train.sh
 #   ARM=separate MAX_STEPS=60000 EXTRA_ARGS="--batch_size 32" sbatch anchor_wm/slurm/train.sh
 set -euo pipefail
-source "${ROOT:-${HOME}/ishan/nuplan_wm}/anchor_wm/slurm/env.sh"
+source "${ROOT:-${SLURM_SUBMIT_DIR:-${PWD}}}/anchor_wm/slurm/env.sh"
 
 if [[ ! -f "${ANCHORS}" ]]; then
   python -m anchor_wm.anchors --cache_dir "${CACHE_DIR}" --out "${ANCHORS%.npz}" --num_anchors 64
