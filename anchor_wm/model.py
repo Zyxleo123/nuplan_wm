@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from anchor_wm.config import SUB_SCORES, AnchorWMConfig
+from anchor_wm.config import OFFROAD_TOL_M, SUB_SCORES, AnchorWMConfig
 from anchor_wm.geometry import (box_corners, candidate_features, edge_signed_distance, ego_center,
                                 polyline_with_extension, project_progress, rotate_xy, sat_gap)
 
@@ -161,7 +161,7 @@ def rule_features(cand_xy: torch.Tensor, cand_yaw: torch.Tensor, ego_lw: torch.T
     (any mode / modes with p >= SEL_MIN_PROB) and independent-agent collision probabilities
     1 - prod_a (1 - sum_m p_am * c(gap)) with c = sigmoid(-gap / 0.25), 1[gap < 0] and a 1 m near-miss
     sigmoid. Static objects (`statics`: xy / yaw / lw / valid at t = 0) count as certain obstacles in all of
-    these. Drivable area: signed distance of the ego box corners (max over corners, > 0 offroad),
+    these. Drivable area: signed distance of the ego box corners (max over corners) minus OFFROAD_TOL_M (> 0 offroad),
     clipped, as an offroad sigmoid and a 0.5 m near-boundary sigmoid. Summary: the per-step maxima /
     minima, the fraction of the horizon before the first hard violation (1 = none) and the mean soft
     collision probability. Only the (agent, mode) slots in wm["slots"] are tested."""
@@ -214,7 +214,8 @@ def rule_features(cand_xy: torch.Tensor, cand_yaw: torch.Tensor, ego_lw: torch.T
         p_near = with_static(ind(torch.sigmoid(-(gap - 1.0) / 0.25)), torch.sigmoid(-(s_gap - 1.0) / 0.25))
 
         q = ec.reshape(b, k * t * 4, 2)
-        sd = edge_signed_distance(q, edges, chunk=1 << 20, budget=edge_budget).view(b, k, t, 4).amax(-1).clamp(-5.0, 5.0)
+        sd = (edge_signed_distance(q, edges, chunk=1 << 20, budget=edge_budget).view(b, k, t, 4).amax(-1)
+              - OFFROAD_TOL_M).clamp(-5.0, 5.0)                                               # > 0: offroad as labelled
         off = torch.sigmoid(sd / 0.1)
         step = torch.stack([g_min.clamp(-2, 10) / 5, g_likely.clamp(-2, 10) / 5, p_soft, p_hard, p_near,
                             sd / 2, off, torch.sigmoid((sd + 0.5) / 0.2)], -1)
@@ -394,7 +395,7 @@ class PlanScorer(nn.Module):
         ext, cum = polyline_with_extension(rxy)
         route = {"xy": rxy, "dir": d / d.norm(dim=-1, keepdim=True).clamp_min(1e-6), "valid": f["route_valid"].bool(),
                  "ext": ext, "cum": cum}
-        label_edges = {k: f[k] for k in ("edge_xy", "edge_dir", "edge_prev_dir", "edge_same_prev", "edge_valid")}
+        label_edges = {k: f[k] for k in ("edge_xy", "edge_dir", "edge_prev_dir", "edge_len", "edge_prev_len", "edge_same_prev", "edge_valid")}
         statics = {"xy": f["static_xy"], "yaw": f["static_yaw"], "lw": f["static_lw"], "valid": f["static_valid"]}
         return dict(tokens=tokens, valid=valid, plan_token=plan_token, wm=wm, wm_tok=wm_tok, edges=edges,
                     edge_tok=edge_tok, ego_lw=f["ego_lw"].float(), agent_idx=aidx, mode_idx=k_sel, route=route,

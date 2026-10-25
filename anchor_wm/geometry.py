@@ -51,8 +51,10 @@ def sat_gap(ca: torch.Tensor, ya: torch.Tensor, cb: torch.Tensor, yb: torch.Tens
 
 
 def edge_signed_distance(query: torch.Tensor, edges: dict, chunk: int = 1024, budget: float = 8e6) -> torch.Tensor:
-    """Signed distance [B,Q] from query points [B,Q,2] to the nearest drivable-area boundary point; > 0 is
-    offroad (outside the drivable area).
+    """Signed distance [B,Q] from query points [B,Q,2] to the drivable-area boundary; > 0 is offroad (outside
+    the drivable area). The magnitude is the distance to the outgoing / incoming segments of the nearest
+    boundary point (`edge_len` / `edge_prev_len`; the point itself when they are missing), which is exact
+    for the densified rings; a nearest-point distance overestimates it by up to ~0.4 m next to the boundary.
 
     The boundary rings are oriented with the drivable side on the left (build_cache), so the rule of
     waymax.metrics.roadgraph.compute_signed_distance_to_nearest_road_edge_point applies: the sign comes
@@ -61,6 +63,8 @@ def edge_signed_distance(query: torch.Tensor, edges: dict, chunk: int = 1024, bu
     Scenes without boundary points return -100 (on road)."""
     exy, edir, eprev = edges["edge_xy"], edges["edge_dir"], edges["edge_prev_dir"]
     esame, evalid = edges["edge_same_prev"].bool(), edges["edge_valid"].bool()
+    elen = edges.get("edge_len", torch.zeros_like(exy[..., 0]))
+    eplen = edges.get("edge_prev_len", torch.zeros_like(exy[..., 0]))
     # Keep the [B,chunk,E,2] difference tensor around `budget` elements (8e6: 64 MB) whatever the number
     # of edge points.
     chunk = max(16, min(chunk, int(budget // max(1, exy.shape[0] * exy.shape[1]))))
@@ -73,11 +77,17 @@ def edge_signed_distance(query: torch.Tensor, edges: dict, chunk: int = 1024, bu
         take = lambda t: torch.gather(t, 1, idx.unsqueeze(-1).expand(-1, -1, t.shape[-1]))  # noqa: E731
         near, ndir, pdir = take(exy), take(edir), take(eprev)
         same = torch.gather(esame, 1, idx)
+        nlen, plen = torch.gather(elen.float(), 1, idx), torch.gather(eplen.float(), 1, idx)
         p2e = q - near
         cross = p2e[..., 0] * ndir[..., 1] - p2e[..., 1] * ndir[..., 0]
         cross_prev = p2e[..., 0] * pdir[..., 1] - p2e[..., 1] * pdir[..., 0]
         signed = torch.where(same & (cross_prev < cross), cross_prev, cross)
-        dist = p2e.norm(dim=-1) * torch.sign(signed)
+        # Distance to the outgoing segment [near, near + nlen * ndir] and the incoming one ending at near.
+        t_out = (p2e * ndir).sum(-1).clamp(min=0.0)
+        t_out = torch.minimum(t_out, nlen)
+        t_in = torch.minimum((-p2e * pdir).sum(-1).clamp(min=0.0), torch.where(same, plen, torch.zeros_like(plen)))
+        dist = torch.minimum((p2e - t_out[..., None] * ndir).norm(dim=-1), (p2e + t_in[..., None] * pdir).norm(dim=-1))
+        dist = dist * torch.sign(signed)
         out.append(torch.where(evalid.any(1, keepdim=True), dist, torch.full_like(dist, -100.0)))
     return torch.cat(out, 1)
 

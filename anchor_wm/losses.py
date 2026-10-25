@@ -168,7 +168,7 @@ def score_loss(total: torch.Tensor, sub: torch.Tensor, labels: dict, valid: torc
 
     # Soft sub-score targets (guidance, not a rule order).
     t_overlap = torch.sigmoid(-labels["clearance"] / tau_overlap)
-    t_offroad = torch.sigmoid(labels["offroad_sd"] / tau_offroad)
+    t_offroad = torch.sigmoid(labels["offroad_depth"] / tau_offroad)
     t_comfort = torch.sigmoid(labels["comfort"] / tau_comfort)
     l_sub = (_bce_soft(sub[..., 0], t_overlap, w) + _bce_soft(sub[..., 1], t_offroad, w)
              + _masked_mean(F.smooth_l1_loss(sub[..., 2].float(), prog_norm, reduction="none", beta=0.1), w)
@@ -225,7 +225,7 @@ def simple_score_loss(total: torch.Tensor, sub: torch.Tensor, labels: dict, vali
     BCE of the overlap / offroad sub-logits toward time-weighted violation targets."""
     h = labels["horizon"].float().clamp_min(1.0)[:, None]
     unsafe = labels["overlap"] | labels["offroad"]
-    severity = (-labels["clearance"]).clamp_min(0.0) + labels["offroad_sd"].clamp_min(0.0)
+    severity = (-labels["clearance"]).clamp_min(0.0) + labels["offroad_depth"].clamp_min(0.0)
     u = simple_utility(unsafe, _time_to_violation(labels), severity, _progress_norm(labels, valid), late=late)
     neg = torch.finfo(torch.float32).min
     target = torch.softmax(u.float().masked_fill(~valid, neg) / temp, -1)

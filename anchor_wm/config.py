@@ -12,6 +12,8 @@ ANCHOR_GROUPS = ("vehicle", "pedestrian", "bicycle")
 MAP_TYPES = ("lane", "lane_connector", "crosswalk", "stop_line")
 TL_STATES = ("green", "yellow", "red", "unknown")
 SUB_SCORES = ("overlap", "offroad", "progress", "comfort")
+# nuplan drivable_area_compliance: a corner is a violation only this far (m) outside the drivable area.
+OFFROAD_TOL_M = 0.3
 
 # Pacifica (nuplan get_pacifica_parameters): the ego frame origin is the rear axle, the box centre is
 # 1.461 m ahead of it.

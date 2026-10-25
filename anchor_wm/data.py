@@ -18,8 +18,12 @@ Model inputs
 Targets / labels (read from the logged future)
   target_delta_xy [N,T,2] (/max_range), target_yaw_vec [N,T,2], target_valid_all [N,T]
   ego_future_xy [T,2], ego_future_yaw [T], ego_future_valid [T]   (rear axle)
-  fut_xy [L,T,2], fut_yaw [L,T], fut_lw [L,T,2], fut_valid [L,T]  log-replay boxes of every cached object
-  edge_xy / edge_dir / edge_prev_dir [E,2], edge_same_prev / edge_valid [E]   drivable-area boundary
+  fut_xy [L,T,2], fut_yaw [L,T], fut_lw [L,T,2], fut_vel [L,T,2], fut_valid [L,T], fut_static [L]
+                                           log-replay boxes of every cached object
+  lane_poly [Lp,2P,2], lane_poly_valid [Lp]  lane / lane-connector polygons (left boundary + reversed right),
+                                           for nuplan's "ego in one or connected lanes" test
+  edge_xy / edge_dir / edge_prev_dir [E,2], edge_len / edge_prev_len / edge_same_prev / edge_valid [E]
+                                           drivable-area boundary points with their outgoing / incoming segments
   tok_edge_xy / tok_edge_dir [Et,2], tok_edge_valid [Et]                       scorer boundary tokens
   route_xy [R,2], route_valid [R]          route centreline, 1 m apart (progress labels, route features)
 """
@@ -121,17 +125,24 @@ def map_arrays(z, cfg: AnchorWMConfig) -> tuple[np.ndarray, np.ndarray]:
     return feat, valid
 
 
+def lane_polygons(z, cfg: AnchorWMConfig) -> dict:
+    nl = int(cfg.max_lanes)
+    poly = np.concatenate([z["lane_left"][:nl], z["lane_right"][:nl, ::-1]], 1)
+    return {"lane_poly": _pad(poly, nl).astype(np.float32), "lane_poly_valid": np.arange(nl) < len(poly)}
+
+
 def edge_arrays(z, cfg: AnchorWMConfig) -> dict:
     """Drivable-area boundary points inside edge_box (label edges, strided to num_label_edges) and the
     scorer's boundary tokens (a further subset inside edge_token_box)."""
     e, et = int(cfg.num_label_edges), int(cfg.num_edge_tokens)
-    xy, d, pd = z["da_xy"], z["da_dir"], z["da_prev_dir"]
+    xy, d, pd, ln, pln = z["da_xy"], z["da_dir"], z["da_prev_dir"], z["da_len"], z["da_prev_len"]
     back, ahead, half = cfg.edge_box
     sel = np.flatnonzero((xy[:, 0] >= back) & (xy[:, 0] <= ahead) & (np.abs(xy[:, 1]) <= half))
     if len(sel) > e:
         sel = sel[::math.ceil(len(sel) / e)][:e]
     k = len(sel)
     out = {"edge_xy": _pad(xy[sel], e), "edge_dir": _pad(d[sel], e), "edge_prev_dir": _pad(pd[sel], e),
+           "edge_len": _pad(ln[sel], e), "edge_prev_len": _pad(pln[sel], e),
            "edge_same_prev": np.arange(e) < k, "edge_valid": np.arange(e) < k}   # closed rings: always same ring
     tback, tahead, thalf = cfg.edge_token_box
     loc = xy[sel]
@@ -216,7 +227,10 @@ def build_sample(z, cfg: AnchorWMConfig, with_targets: bool = True) -> dict[str,
         fut_xy=_pad(lab[..., :2], nl).astype(np.float32),
         fut_yaw=_pad(lab[..., 2], nl).astype(np.float32),
         fut_lw=_pad(np.broadcast_to(z["obj_lw"][:nl, None], (len(lab), t, 2)), nl).astype(np.float32),
+        fut_vel=_pad(z["obj_vel"][:nl, fut_idx], nl).astype(np.float32),
         fut_valid=_pad(z["obj_valid"][:nl, fut_idx], nl),
+        fut_static=_pad(z["obj_type"][:nl] >= len(ANCHOR_GROUPS), nl),
+        **lane_polygons(z, cfg),
     )
     return out
 

@@ -4,7 +4,8 @@ at t = 0 (origin at the rear axle, x forward, y left; metres / radians, float32)
 The time grid is 0.1 s: PAST_FRAMES = 21 frames up to and including t = 0, then FUTURE_FRAMES = 80
 (t = 0.1 ... 8.0 s), so frame 20 is "now". Per file:
 
-  meta        log_name, token, map_name, scenario_type, timestamp_us
+  meta        log_name, token, map_name, scenario_type, timestamp_us, origin_pose (world x, y, yaw of the frame;
+              float64)
   ego         ego_pose [101,3] (x, y, yaw of the rear axle), ego_vel / ego_acc [101,2] (rear-axle velocity /
               acceleration rotated into the t = 0 frame)
   objects     every tracked object (vehicle / pedestrian / bicycle / czone sign / barrier / traffic cone /
@@ -20,9 +21,10 @@ The time grid is 0.1 s: PAST_FRAMES = 21 frames up to and including t = 0, then 
   route       route_xy [R,2]: centreline of the lane path along the (corrected) route roadblocks, 1 m apart,
               from 30 m behind the ego's projection on it; empty when no route lane is found near the ego
   goal        goal_pose [3], goal_valid (mission goal, scenario.get_mission_goal)
-  drivable    da_xy / da_dir / da_prev_dir [E,2]: boundary of the union of the DRIVABLE_AREA layer (what
-              nuplan's drivable_area_compliance uses), 1 m apart within --da_radius. Rings are oriented
-              so the drivable side is on the left of `da_dir`, which gives the Waymax-style signed distance
+  drivable    da_xy / da_dir / da_prev_dir [E,2], da_len / da_prev_len [E]: boundary of the union of the
+              DRIVABLE_AREA layer (what nuplan's drivable_area_compliance uses) within --da_radius: the ring
+              vertices plus points at most 1 m apart, each with its outgoing / incoming segment. Rings are
+              oriented so the drivable side is on the left of `da_dir`, which gives the Waymax-style sign
               (> 0 offroad) with every point's predecessor on the same ring.
 
   python -m anchor_wm.build_cache --data_path .../nuplan-v1.1/splits/trainval --map_path .../maps \
@@ -70,6 +72,7 @@ MAP_POINTS = 20
 NUM_FRAMES = PAST_FRAMES + FUTURE_FRAMES
 ROUTE_BEHIND_M = 30.0
 DA_SMOOTH_M = 0.1
+DA_SPACING_M = 1.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -302,7 +305,8 @@ def drivable_area_arrays(map_api, origin: np.ndarray, radius: float, max_points:
     layer = map_api._get_vector_map_layer(SemanticMapLayer.DRIVABLE_AREA)   # union of the drivable layers
     patch = box(origin[0] - radius, origin[1] - radius, origin[0] + radius, origin[1] + radius)
     geoms = [g for g in layer.geometry.iloc[layer.sindex.query(patch, predicate="intersects")] if g is not None]
-    empty = {"da_xy": np.zeros((0, 2)), "da_dir": np.zeros((0, 2)), "da_prev_dir": np.zeros((0, 2))}
+    empty = {"da_xy": np.zeros((0, 2)), "da_dir": np.zeros((0, 2)), "da_prev_dir": np.zeros((0, 2)),
+             "da_len": np.zeros(0), "da_prev_len": np.zeros(0)}
     if not geoms:
         return empty
     # Closing then opening (grow, union, shrink twice, grow): adjacent map polygons leave hairline cracks and
@@ -310,24 +314,30 @@ def drivable_area_arrays(map_api, origin: np.ndarray, radius: float, max_points:
     # offroad sign of points metres away. Features narrower than 2 * DA_SMOOTH_M are removed.
     union = unary_union([g.buffer(DA_SMOOTH_M) for g in geoms]).buffer(-2.0 * DA_SMOOTH_M).buffer(DA_SMOOTH_M)
     polys = [union] if isinstance(union, Polygon) else [g for g in getattr(union, "geoms", []) if isinstance(g, Polygon)]
-    xy, dirs, prev = [], [], []
+    out = {k: [] for k in empty}
     for poly in polys:
         poly = orient(poly, sign=1.0)                       # exterior CCW, holes CW: drivable side on the left
         for ring in [poly.exterior, *poly.interiors]:
-            n = max(int(ring.length), 3)
-            p = shapely.get_coordinates(shapely.line_interpolate_point(ring, np.linspace(0.0, ring.length, n, endpoint=False)))
-            d = np.roll(p, -1, 0) - p
-            d = d / np.maximum(np.linalg.norm(d, axis=-1, keepdims=True), 1e-6)
+            # The ring's own vertices plus points so that no segment is longer than DA_SPACING_M; every point
+            # keeps its outgoing / incoming segment (direction, length) for exact point-to-segment distances.
+            p = shapely.get_coordinates(shapely.segmentize(ring, DA_SPACING_M))[:-1]
+            # Drop repeated vertices: a zero-length segment has no direction, which would flip the sign.
+            p = p[np.linalg.norm(np.roll(p, -1, 0) - p, axis=-1) > 1e-3]
+            if len(p) < 3:
+                continue
+            seg = np.roll(p, -1, 0) - p
+            length = np.linalg.norm(seg, axis=-1)
+            d = rotate_to_local(seg / np.maximum(length, 1e-6)[:, None], np.full(len(p), origin[2]))
             local = to_local(p, origin)
             inside = (np.abs(local) <= radius).all(-1)
-            xy.append(local[inside])
-            dirs.append(rotate_to_local(d, np.full(n, origin[2]))[inside])
-            prev.append(rotate_to_local(np.roll(d, 1, 0), np.full(n, origin[2]))[inside])
-    xy, dirs, prev = np.concatenate(xy), np.concatenate(dirs), np.concatenate(prev)
-    if len(xy) > max_points:
-        keep = np.sort(np.argsort(np.linalg.norm(xy, axis=-1), kind="stable")[:max_points])
-        xy, dirs, prev = xy[keep], dirs[keep], prev[keep]
-    return {"da_xy": xy, "da_dir": dirs, "da_prev_dir": prev}
+            for key, v in (("da_xy", local), ("da_dir", d), ("da_prev_dir", np.roll(d, 1, 0)), ("da_len", length),
+                           ("da_prev_len", np.roll(length, 1))):
+                out[key].append(v[inside])
+    out = {k: np.concatenate(v) for k, v in out.items()}
+    if len(out["da_xy"]) > max_points:
+        keep = np.sort(np.argsort(np.linalg.norm(out["da_xy"], axis=-1), kind="stable")[:max_points])
+        out = {k: v[keep] for k, v in out.items()}
+    return out
 
 
 def process_scenario(scenario, args) -> dict:
@@ -351,6 +361,7 @@ def process_scenario(scenario, args) -> dict:
 
     data = {"log_name": scenario.log_name, "token": scenario.token, "map_name": scenario.map_api.map_name,
             "scenario_type": scenario.scenario_type, "timestamp_us": np.int64(scenario.start_time.time_us),
+            "origin_pose": origin.copy(),
             "goal_pose": goal_pose, "goal_valid": np.bool_(goal is not None)}
     data.update(ego)
     data.update(object_arrays(scenario, origin, args.object_radius, args.max_objects))
@@ -358,7 +369,8 @@ def process_scenario(scenario, args) -> dict:
     data.update(polygon_arrays(map_api, point, origin, args.map_radius, args.max_polygons))
     data["route_xy"] = route_centerline(map_api, point, origin, route_ids, args.route_length_m)
     data.update(drivable_area_arrays(map_api, origin, args.da_radius, args.max_da_points))
-    return {k: v.astype(np.float32) if isinstance(v, np.ndarray) and v.dtype == np.float64 else v for k, v in data.items()}
+    return {k: v.astype(np.float32) if isinstance(v, np.ndarray) and v.dtype == np.float64 and k != "origin_pose" else v
+            for k, v in data.items()}
 
 
 def cache_file(save_path: str, scenario) -> str:

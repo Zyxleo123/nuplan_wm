@@ -139,6 +139,8 @@ def scorer_step(model: AnchorWorldModel, enc: dict, dec: dict, f: dict, args, cf
         metrics["scene_kept"] = float(gt_ok.float().mean())
         gt_valid = take(cands["valid"], idx)[:, 0]
         metrics["gt_overlap_rate"] = float((gt_valid & labels["overlap"][:, 0]).float().mean())
+        metrics["gt_any_overlap_rate"] = float((gt_valid & labels["any_overlap"][:, 0]).float().mean())
+        metrics["cand_any_overlap_rate"] = float((labels["any_overlap"].float() * valid).sum() / valid.sum().clamp_min(1))
         metrics["gt_offroad_rate"] = float((gt_valid & labels["offroad"][:, 0]).float().mean())
         kinds = take(cands["kinds"][None].expand(idx.shape[0], -1), idx)
         unsafe = (labels["overlap"] | labels["offroad"]).float()

@@ -78,10 +78,10 @@ scenarios) is about 320 KB per scenario, so the full ~600k-scenario cache is abo
 | History / horizon | 10 steps x 0.2 s, **25 steps x 0.2 s (5 s)** | 21 frames x 0.1 s (2 s), **80 steps x 0.1 s (8 s)** | the usual nuPlan setup (PlanTF, PLUTO, Diffusion Planner, `mini_diffusion_policy`); a planner's 0.1 s output needs no resampling for the 10 Hz simulation |
 | Agents | up to 128 WOMD objects incl. the SDC | ego (slot 0) + 63 nearest vehicles / pedestrians / bicycles at t = 0 | nuPlan scenes list all detections; the nearest 63 cover the scorer's 32 |
 | Static objects | not in WOMD tracks | cones / barriers / signs / generic objects: **encoder tokens** (32 nearest), exact box gaps in the scorer's rule features, and overlap-label obstacles | frequent in nuPlan (construction zones), collisions with them matter |
-| Overlap labels | logged boxes of every WOMD object | log-replay boxes of every cached object (192 nearest, incl. static and late-appearing ones); checked at the 0.1 s plan steps (WOMD: 0.2 s steps plus midpoints; midpoints, still used for coarser steps, interpolate box headings modulo pi) | at 0.1 s midpoints change no label but double the cost; nuPlan tracks flip long-vehicle headings by pi between frames (a plain angle midpoint rotated a truck crosswise) |
+| Collision labels | any overlap with a logged WOMD box | **nuPlan's at-fault rule** (`no_ego_at_fault_collisions`): each object's first contact is classified as nuplan's `_get_collision_type` does (ego stopped <= 0.05 m/s: not at fault; object stopped, incl. every static object: at fault; object behind, > 150 deg from the ego heading: not at fault; front-bumper contact: at fault; else lateral: at fault when the ego's corners are not in one / connected lane, tested on the cached lane polygons without the lane graph). Log-replay boxes of every cached object (192 nearest, incl. static and late-appearing ones) at the 0.1 s plan steps; midpoints (for coarser steps) interpolate box headings modulo pi | CLS is the benchmark. Log replay is non-reactive, so any-overlap counted being rear-ended: stops had 41-44% contact and now 0% at fault. nuPlan tracks flip long-vehicle headings by pi between frames (a plain angle midpoint rotated a truck crosswise) |
 | Map | WOMD roadgraph polylines (21 types) + traffic-light points | lanes / lane connectors (centre + left / right boundary offsets, on-route flag, traffic-light state, speed limit) and crosswalk / stop-line polygons; no separate light tokens | nuPlan map API; lights are per lane connector |
 | Goal | last logged SDC position of the episode, fed to the SDC query and the scorer | **route**: the SDC query and the scorer's plan token get 10 route-centreline points 10 m apart + ego velocity; mission goal optional (`--use_goal`) | the mission goal is often hundreds of metres to kilometres away, or missing; the route says which lanes to take |
-| Offroad | Waymax road-edge points, sign from the prior-point rule | boundary of the union of the **DRIVABLE_AREA** layer (road segments, intersections, generic drivable areas, car parks), oriented with the drivable side on the left, 1 m spacing; same signed-distance rule. Map cracks / slivers < 20 cm are removed (closing + opening) | PDMS / nuplan `drivable_area_compliance`: every ego corner inside the drivable area. Without the smoothing, hairline gaps between map polygons flipped the sign 3-4 m away |
+| Offroad | Waymax road-edge points, sign from the prior-point rule, > 0 m | **nuplan `drivable_area_compliance`**: a box corner more than **0.3 m** outside the union of the DRIVABLE_AREA layer (road segments, intersections, generic drivable areas, car parks); the ego-lane exemption is not modelled. Boundary = ring vertices + points <= 1 m apart, oriented with the drivable side on the left, each with its segments; distance to those segments, sign from the prior-point rule. Map cracks / slivers < 20 cm are removed (closing + opening), repeated vertices dropped | CLS. Matches an exact point-in-polygon test on all 6300 smoke candidates. Without the smoothing, hairline gaps between map polygons flipped the sign 3-4 m away; nearest-point distances overestimated it by up to ~0.4 m near the threshold |
 | Progress label | `goal_gain` = goal distance reduction; `goal_dist` precision term | `route_progress` along the route centreline from the ego's projection (logged path when there is no route), normalised by the group's best (PDM ego progress) | no near goal in nuPlan |
 | Simple loss utility | unsafe tiers + goal gain + `log(1 + goal_dist)` | unsafe tiers + route progress / group best (no goal-distance term) | as above |
 | Aux heads | time to violation, goal distance | time to violation, normalised route progress | as above |
@@ -94,18 +94,26 @@ scenarios) is about 320 KB per scenario, so the full ~600k-scenario cache is abo
 
 ## Smoke tests (babel, 300-scenario cache from 12 logs)
 
-- Labels on the logged futures: 0% overlap, 0% offroad (before the fixes in the table: 1.3% / 5%).
-  Route progress of the logged future matches its path progress to 0.2 m on average.
-- Perturbations of the logged future: +-0.75 m lateral 2-6% overlap, x1.2 speed 3%, stops ~40% (rear-ended
-  in log replay after ~4 s); stopped egos 9% (70% before the heading / lateral-fade fix).
+- Labels on the logged futures: 0% at-fault collision (0.7% any contact), 0% offroad (before the fixes in
+  the table: 1.3% overlap / 5% offroad). Route progress of the logged future matches its path progress to
+  0.2 m on average.
+- Offroad vs an exact CLS-style test (distance of each corner to the raw DRIVABLE_AREA polygons >= 0.3 m) on
+  the logged future, its 16 perturbations and +-4 / 6 m lateral offsets: 6300 / 6300 candidates agree.
+- At-fault vs any contact per perturbation: stops 0% vs 41-44%, x0.5 speed 0.7% vs 32%, lateral shifts
+  mostly at fault (e.g. +-3 m: 25-26% vs 30-32%); stopped egos rarely touch anything after the heading /
+  lateral-fade fix (9% contact, 70% before).
 - Training, 200 steps at batch 16 on an L40S (`SMOKE=1`, 0.1 s / 80 steps), every arm / loss: no non-finite
-  steps; val minADE@6 4.1 -> 2.7-3.1 m; joint scorer pairwise accuracy 0.86-0.87 and picked-unsafe
-  0.14-0.16 (simple / current loss). 0.44 s/step and 13.7 GB peak with the scorer, 0.03 s/step forecasting
-  only. Resume, `--file_list` and `--use_goal` also run.
+  steps; val minADE@6 4.1 -> 2.7-3.0 m; joint scorer pairwise accuracy 0.81-0.85 and picked-unsafe
+  0.07-0.08 (current / simple loss; 48% of candidates unsafe). 0.46 s/step and ~14 GB peak with the scorer,
+  0.03 s/step forecasting only. Resume, `--file_list` and `--use_goal` also run.
 
 ## Known gaps
 
-- Overlap labels use any overlap, not nuPlan's at-fault collision logic; no TTC, driving-direction
-  or lane-keeping terms from PDMS yet.
+- Of nuPlan's CLS terms only at-fault collisions and drivable-area compliance are labels; no TTC,
+  driving-direction compliance, making-progress or speed-limit terms yet. Collisions with static objects
+  count as unsafe (CLS halves the score for the first one).
+- The lateral at-fault test assumes front and rear corners in different lanes are connected (no lane graph
+  in the cache), and the drivable-area ego-lane exemption is not modelled.
+- Log replay is non-reactive (CLS-NR); agents never react to the candidate.
 - Static objects are taken at their t = 0 pose in the scorer's rule features (labels use the full log).
 - Pedestrians and bicycles use Cartesian anchors like vehicles.
