@@ -42,6 +42,7 @@ is done once (`--make_plan` writes {log_name: [tokens]}); each shard then opens 
 skips scenarios whose file exists, so a preempted shard restarts where it stopped.
 
   python -m anchor_wm.build_cache ... --total_scenarios 1000000 --plan_file .../plan.json --make_plan
+  python -m anchor_wm.build_cache ... --plan_file .../plan.json --make_plan --plan_from_list diffusion_planner_training.json
   python -m anchor_wm.build_cache ... --plan_file .../plan.json --num_shards 8 --shard_id 3
 """
 
@@ -124,6 +125,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--shard_id", type=int, default=0)
     p.add_argument("--plan_file", default="", help="scenario plan: written with --make_plan, read by the shards")
     p.add_argument("--make_plan", action="store_true", help="list the scenarios, write --plan_file and exit")
+    p.add_argument("--plan_from_list", default="",
+                   help="with --make_plan: take the scenarios from an existing file list (<map>_<token>.npz names, e.g. "
+                        "Diffusion-Planner's diffusion_planner_training.json) instead of listing them")
     p.add_argument("--max_tasks_per_child", type=int, default=20,
                    help="restart workers after this many logs (bounds the devkit's map-object cache)")
     p.add_argument("--seed", type=int, default=0)
@@ -571,6 +575,34 @@ def list_scenarios(args, db_files: list | None, log_names: list | None, tokens: 
     return sorted(builder.get_scenarios(scenario_filter(args, log_names, tokens), worker), key=lambda s: (s.log_name, s.token))
 
 
+def _log_tokens(db_file: str) -> tuple:
+    con = sqlite3.connect(db_file)
+    try:
+        return os.path.basename(db_file)[:-3], [r[0].hex() for r in con.execute("SELECT token FROM lidar_pc")]
+    finally:
+        con.close()
+
+
+def plan_from_list(args, log_names: list | None) -> dict:
+    """{log_name: [tokens]} for the scenarios of an existing <map>_<token>.npz list: each token is found in its
+    log's lidar_pc table."""
+    with open(args.plan_from_list) as fh:
+        wanted = {os.path.basename(n)[:-4].rsplit("_", 1)[1] for n in json.load(fh)}
+    dbs = sorted(glob.glob(os.path.join(args.data_path, "*.db")))
+    if log_names is not None:
+        keep = set(log_names)
+        dbs = [f for f in dbs if os.path.basename(f)[:-3] in keep]
+    plan = {}
+    with Pool(args.num_workers) as pool:
+        for log, tokens in pool.imap_unordered(_log_tokens, dbs, chunksize=4):
+            found = sorted(wanted.intersection(tokens))
+            if found:
+                plan[log] = found
+    found = sum(map(len, plan.values()))
+    print(json.dumps({"listed": len(wanted), "found": found, "missing": len(wanted) - found, "logs": len(plan)}), flush=True)
+    return plan
+
+
 def shard_logs(plan: dict, num_shards: int, shard_id: int) -> list:
     """Logs of one shard: greedy balance of the scenario counts, largest logs first (deterministic)."""
     loads, owner = [0] * num_shards, {}
@@ -601,6 +633,12 @@ def main() -> None:
             return
         scenarios = list_scenarios(args, [os.path.join(args.data_path, g + ".db") for g in todo], list(todo),
                                    [t for ts in todo.values() for t in ts])
+    elif args.make_plan and args.plan_from_list:
+        plan = plan_from_list(args, log_names)
+        with open(args.plan_file, "w") as fh:
+            json.dump({"args": vars(args), "num_scenarios": sum(map(len, plan.values())), "logs": plan}, fh)
+        print(json.dumps({"plan": args.plan_file, "list_s": round(time.time() - t0, 1)}), flush=True)
+        return
     else:
         db_files = None
         if args.max_db_files:

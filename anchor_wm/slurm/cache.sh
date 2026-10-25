@@ -14,6 +14,7 @@
 #                so a preempted / requeued task only fills the rest)
 #
 #   STEP=plan TOTAL=1000000 sbatch --cpus-per-task=32 anchor_wm/slurm/cache.sh
+#   STEP=plan EXTRA_ARGS="--plan_from_list diffusion_planner_training.json" sbatch anchor_wm/slurm/cache.sh   (reuse a list)
 #   sbatch --array=0-7 --dependency=afterok:<plan job> anchor_wm/slurm/cache.sh
 #   CACHE_DIR=.../cache_smoke EXTRA_ARGS="--max_db_files 12 --total_scenarios 300" STEP=direct sbatch anchor_wm/slurm/cache.sh
 set -euo pipefail

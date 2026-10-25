@@ -42,10 +42,11 @@ Submit from the repo root. `slurm/env.sh` defaults to the conda env `nuplan_wm`,
 # 1. cache. Smoke-sized (lists and builds in one job):
 STEP=direct CACHE_DIR=/data/user_data/$USER/anchor_wm_nuplan/cache_smoke \
   EXTRA_ARGS="--max_db_files 12 --total_scenarios 300" sbatch anchor_wm/slurm/cache.sh
-# Full: list once (same 1M-scenario filter / seed as data_process.py), then build in shards. Listing reads
-# every log, so the shards don't repeat it; each opens only its own logs and skips files that exist.
-plan=$(STEP=plan TOTAL=1000000 sbatch --parsable --cpus-per-task=32 anchor_wm/slurm/cache.sh)
-sbatch --array=0-7 --dependency=afterok:${plan} anchor_wm/slurm/cache.sh
+# Full: plan once, then build in shards (each opens only its own logs and skips files that exist). The plan
+# reuses Diffusion-Planner's 1M training list (diffusion_planner_training.json, written by data_process.py),
+# finding each token's log; without --plan_from_list it re-lists every log with the same filter / seed.
+plan=$(STEP=plan EXTRA_ARGS="--plan_from_list diffusion_planner_training.json" sbatch --parsable --cpus-per-task=32 anchor_wm/slurm/cache.sh)
+sbatch --array=0-3 --dependency=afterok:${plan} anchor_wm/slurm/cache.sh
 
 # 2. anchors (train.sh fits them when ANCHORS is missing) + training
 sbatch anchor_wm/slurm/train.sh                          # joint, current loss
