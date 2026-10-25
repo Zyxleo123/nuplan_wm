@@ -80,9 +80,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scorer_modes", type=int, default=6)
     p.add_argument("--scorer_near_agents", type=int, default=8)
     p.add_argument("--scorer_near_modes", type=int, default=12)
-    p.add_argument("--no_route_features", action="store_true")
-    p.add_argument("--no_rule_features", action="store_true")
-    p.add_argument("--no_aux_heads", action="store_true")
     p.add_argument("--use_goal", action="store_true", help="also feed the mission goal (ego query and scorer)")
     # bookkeeping
     p.add_argument("--log_every", type=int, default=50)
@@ -131,8 +128,7 @@ def scorer_step(model: AnchorWorldModel, enc: dict, dec: dict, f: dict, args, cf
     gt_ok = valid[:, 0] & ~(labels["overlap"][:, 0] | labels["offroad"][:, 0])
     valid = valid & gt_ok[:, None]
     ctx = model.scorer.context(enc, dec, f, scale)
-    total, sub = model.scorer(ctx, xy, yaw, chunk=args.score_chunk)
-    aux = dict(model.scorer.last_aux)
+    total, sub, aux = model.scorer(ctx, xy, yaw, chunk=args.score_chunk)
     if args.scorer_loss == "simple":
         loss, metrics = simple_score_loss(total, sub, labels, valid, w_safe=args.simple_w_safe, temp=args.simple_temp,
                                           progress_margin=args.progress_margin, aux=aux, w_aux=args.w_aux)
@@ -204,9 +200,7 @@ def build_config(args, num_anchors: int) -> AnchorWMConfig:
                           scorer_hidden=args.scorer_hidden, sigma_eps=args.sigma_eps,
                           scorer_agents=args.scorer_agents, scorer_modes=args.scorer_modes,
                           scorer_near_agents=args.scorer_near_agents, scorer_near_modes=args.scorer_near_modes,
-                          scorer_route_features=not args.no_route_features,
-                          scorer_rule_features=not args.no_rule_features,
-                          scorer_aux_heads=not args.no_aux_heads, use_goal=args.use_goal)
+                          use_goal=args.use_goal)
 
 
 def main() -> None:

@@ -164,7 +164,7 @@ def rule_features(cand_xy: torch.Tensor, cand_yaw: torch.Tensor, ego_lw: torch.T
     these. Drivable area: signed distance of the ego box corners (max over corners, > 0 offroad),
     clipped, as an offroad sigmoid and a 0.5 m near-boundary sigmoid. Summary: the per-step maxima /
     minima, the fraction of the horizon before the first hard violation (1 = none) and the mean soft
-    collision probability. Only the (agent, mode) slots in wm["slots"] (None = all) are tested."""
+    collision probability. Only the (agent, mode) slots in wm["slots"] are tested."""
     with torch.autocast(cand_xy.device.type, enabled=False):
         cand_xy, cand_yaw, ego_lw = cand_xy.float(), cand_yaw.float(), ego_lw.float()
         b, k, t, _ = cand_xy.shape
@@ -176,15 +176,13 @@ def rule_features(cand_xy: torch.Tensor, cand_yaw: torch.Tensor, ego_lw: torch.T
         size = wm["size"].float()[:, :, None, None].expand(b, a, m, t, 2)
         oc = box_corners(xy, yaw, size).permute(0, 3, 1, 2, 4, 5).reshape(b, 1, t, a * m, 4, 2)
         o_yaw = yaw.permute(0, 3, 1, 2).reshape(b, 1, t, a * m)
-        slots = wm.get("slots")
-        if slots is not None:
-            oc, o_yaw = oc[:, :, :, slots], o_yaw[:, :, :, slots]
+        slots = wm["slots"]
+        oc, o_yaw = oc[:, :, :, slots], o_yaw[:, :, :, slots]
         n_slot = oc.shape[3]
         n_step = max(1, int(pair_budget // max(1, b * k * t)))
         gap = torch.cat([sat_gap(ec.unsqueeze(3), cand_yaw.unsqueeze(-1), oc[:, :, :, n0:n0 + n_step],
                                  o_yaw[:, :, :, n0:n0 + n_step]) for n0 in range(0, n_slot, n_step)], -1)
-        if slots is not None:
-            gap = torch.full((b, k, t, a * m), 50.0, device=gap.device, dtype=gap.dtype).index_copy(-1, slots, gap)
+        gap = torch.full((b, k, t, a * m), 50.0, device=gap.device, dtype=gap.dtype).index_copy(-1, slots, gap)
         gap = gap.view(b, k, t, a, m)
         big = torch.full_like(gap, 50.0)
         g_min = torch.where(live[:, None, None], gap, big).amin((-1, -2))
@@ -322,16 +320,12 @@ class PlanScorer(nn.Module):
         self.trunk = nn.Sequential(nn.LayerNorm(7 * h), nn.Linear(7 * h, h), nn.GELU(), nn.Dropout(cfg.dropout))
         self.sub_head = nn.Linear(h, len(SUB_SCORES))
         self.total_head = nn.Linear(h, 1)
-        if cfg.scorer_route_features:
-            self.route_step = _MLP(3, h, h)         # added to the candidate step embedding
-            self.route_end = _MLP(4, h, h)          # added to the pooled representation
-        if cfg.scorer_rule_features:
-            self.rule_step = _MLP(RULE_STEP_DIM, h, h)
-            self.rule_end = _MLP(RULE_END_DIM, h, h)
-        if cfg.scorer_aux_heads:
-            self.ttv_head = nn.Linear(h, 1)         # time to first violation / horizon (1 = none)
-            self.progress_head = nn.Linear(h, 1)    # route progress / best in the group
-        self.last_aux: dict[str, torch.Tensor] = {}
+        self.route_step = _MLP(3, h, h)             # added to the candidate step embedding
+        self.route_end = _MLP(4, h, h)              # added to the pooled representation
+        self.rule_step = _MLP(RULE_STEP_DIM, h, h)
+        self.rule_end = _MLP(RULE_END_DIM, h, h)
+        self.ttv_head = nn.Linear(h, 1)             # time to first violation / horizon (1 = none)
+        self.progress_head = nn.Linear(h, 1)        # route progress / best in the group
 
     # ---- candidate-independent context ------------------------------------------------------
 
@@ -364,7 +358,7 @@ class PlanScorer(nn.Module):
         valid = torch.cat([enc["scene_valid"], torch.ones_like(enc["scene_valid"][:, :1])], 1)
 
         # Top modes per agent, then the agents that matter for the ego (nearest first).
-        ms = cfg.scorer_modes_max
+        ms = int(cfg.scorer_near_modes)
         top_p, top_k = torch.topk(dec["probs"].detach(), ms, dim=-1)                          # [B,N,M]
         cur = f["current_local_xy"].float()
         mean_all = cur[:, :, None, None] + gather_k(dec["pred_xy_k"].detach(), top_k) * rng
@@ -382,8 +376,7 @@ class PlanScorer(nn.Module):
         sigma = grad_scale(sel(dec["sigma_k"]), scale) * rng                                  # agent frame, m
         probs = grad_scale(sel(dec["probs"]), scale)
         keep, slots = self._mode_slots(a, ms, probs.device)
-        if keep is not None:
-            probs = probs * keep                                                              # far agents: top scorer_modes
+        probs = probs * keep                                                                  # far agents: top scorer_modes
         probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-6)
         probs = probs * avalid[..., None]
         size = g2(f["agent_history"][:, :, -1, 6:8].float() * cfg.max_width)                  # length, width
@@ -395,26 +388,22 @@ class PlanScorer(nn.Module):
         e_mask = f["tok_edge_valid"].bool()
         edges = {"xy": f["tok_edge_xy"].float(), "dir": f["tok_edge_dir"].float(), "mask": e_mask}
         edge_tok = self.edge_embed(torch.cat([edges["xy"] / self.pos_scale, edges["dir"], e_mask[..., None].float()], -1))
-        ctx = dict(tokens=tokens, valid=valid, plan_token=plan_token, wm=wm, wm_tok=wm_tok, edges=edges,
-                   edge_tok=edge_tok, ego_lw=f["ego_lw"].float(), agent_idx=aidx, mode_idx=k_sel)
-        if cfg.scorer_route_features:
-            rxy = f["route_xy"].float()
-            d = torch.diff(rxy, dim=1)
-            d = torch.cat([d, d[:, -1:]], 1)
-            ext, cum = polyline_with_extension(rxy)
-            ctx["route"] = {"xy": rxy, "dir": d / d.norm(dim=-1, keepdim=True).clamp_min(1e-6),
-                            "valid": f["route_valid"].bool(), "ext": ext, "cum": cum}
-        if cfg.scorer_rule_features:
-            ctx["label_edges"] = {k: f[k] for k in ("edge_xy", "edge_dir", "edge_prev_dir", "edge_same_prev", "edge_valid")}
-            ctx["statics"] = {"xy": f["static_xy"], "yaw": f["static_yaw"], "lw": f["static_lw"], "valid": f["static_valid"]}
-        return ctx
+        rxy = f["route_xy"].float()
+        d = torch.diff(rxy, dim=1)
+        d = torch.cat([d, d[:, -1:]], 1)
+        ext, cum = polyline_with_extension(rxy)
+        route = {"xy": rxy, "dir": d / d.norm(dim=-1, keepdim=True).clamp_min(1e-6), "valid": f["route_valid"].bool(),
+                 "ext": ext, "cum": cum}
+        label_edges = {k: f[k] for k in ("edge_xy", "edge_dir", "edge_prev_dir", "edge_same_prev", "edge_valid")}
+        statics = {"xy": f["static_xy"], "yaw": f["static_yaw"], "lw": f["static_lw"], "valid": f["static_valid"]}
+        return dict(tokens=tokens, valid=valid, plan_token=plan_token, wm=wm, wm_tok=wm_tok, edges=edges,
+                    edge_tok=edge_tok, ego_lw=f["ego_lw"].float(), agent_idx=aidx, mode_idx=k_sel, route=route,
+                    label_edges=label_edges, statics=statics)
 
     def _mode_slots(self, a: int, m: int, device):
         """Mode keep mask [A,M] and flat (agent, mode) slot indices: the first scorer_near_agents agents
-        keep all m modes, the others the top scorer_modes. (None, None) when every agent keeps all."""
+        keep all m (= scorer_near_modes) modes, the others the top scorer_modes."""
         cfg = self.cfg
-        if cfg.scorer_near_agents <= 0 or m == int(cfg.scorer_modes):
-            return None, None
         keep = ((torch.arange(a, device=device)[:, None] < int(cfg.scorer_near_agents))
                 | (torch.arange(m, device=device)[None, :] < int(cfg.scorer_modes)))
         return keep, keep.flatten().nonzero().squeeze(-1)
@@ -430,7 +419,7 @@ class PlanScorer(nn.Module):
         tok = self.mode_temporal(self.mode_embed(torch.cat(feats, -1)))                       # [B,A,M,T,H]
         tok = tok + query[:, :, :, None] + self.prob_embed(torch.log(wm["probs"].clamp(min=1e-4))[..., None])[:, :, :, None]
         tok = tok.permute(0, 3, 1, 2, 4).reshape(b, t, a * m, -1)                            # [B,T,A*M,H]
-        return tok if wm.get("slots") is None else tok[:, :, wm["slots"]]                    # [B,T,S,H]
+        return tok[:, :, wm["slots"]]                                                         # [B,T,S,H]
 
     # ---- candidate geometry -------------------------------------------------------------------
 
@@ -445,10 +434,9 @@ class PlanScorer(nn.Module):
         # ego-frame (sxx, syy, sxy) cancels catastrophically in fp32 for thin, long Gaussians).
         var = (wm["sigma"].permute(0, 3, 1, 2, 4).reshape(b, 1, t, a * m, 2)).square() + 0.05            # [B,1,T,N,2]
         cov_yaw = wm["cov_yaw"][:, :, None].expand(b, a, m).reshape(b, 1, 1, a * m)
-        slots = wm.get("slots")
-        if slots is not None:
-            agent_xy, agent_yaw, size = agent_xy[:, :, :, slots], agent_yaw[:, :, :, slots], size[:, :, :, slots]
-            var, cov_yaw = var[:, :, :, slots], cov_yaw[:, :, :, slots]
+        slots = wm["slots"]
+        agent_xy, agent_yaw, size = agent_xy[:, :, :, slots], agent_yaw[:, :, :, slots], size[:, :, :, slots]
+        var, cov_yaw = var[:, :, :, slots], cov_yaw[:, :, :, slots]
         d = agent_xy - cand_xy.unsqueeze(3)                                                   # [B,K,T,N,2]
         c, s = torch.cos(cand_yaw).unsqueeze(-1), torch.sin(cand_yaw).unsqueeze(-1)
         dx, dy = c * d[..., 0] + s * d[..., 1], -s * d[..., 0] + c * d[..., 1]
@@ -484,9 +472,9 @@ class PlanScorer(nn.Module):
     # ---- scoring ------------------------------------------------------------------------------
 
     def forward(self, ctx: dict, cand_xy: torch.Tensor, cand_yaw: torch.Tensor,
-                chunk: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-        """cand_xy [B,C,T,2] (m, ego frame, rear axle), headings [B,C,T] -> total [B,C], sub-logits [B,C,S].
-        The aux heads' outputs are left in `self.last_aux`."""
+                chunk: int = 0) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """cand_xy [B,C,T,2] (m, ego frame, rear axle), headings [B,C,T] -> total [B,C], sub-logits [B,C,S]
+        and the aux heads {"ttv", "progress"} [B,C]."""
         count = cand_xy.shape[1]
         step = chunk if chunk and chunk < count else count
         totals, subs, auxs = [], [], []
@@ -496,8 +484,7 @@ class PlanScorer(nn.Module):
             totals.append(tot)
             subs.append(sub)
             auxs.append(aux)
-        self.last_aux = {key: torch.cat([a[key] for a in auxs], 1) for key in auxs[0]} if auxs[0] else {}
-        return torch.cat(totals, 1), torch.cat(subs, 1)
+        return torch.cat(totals, 1), torch.cat(subs, 1), {key: torch.cat([a[key] for a in auxs], 1) for key in auxs[0]}
 
     def _score_chunk(self, ctx: dict, cand_xy: torch.Tensor, cand_yaw: torch.Tensor):
         bsz, count, steps, _ = cand_xy.shape
@@ -505,12 +492,9 @@ class PlanScorer(nn.Module):
         center = ego_center(cand_xy, cand_yaw)                       # geometry against boxes / boundary
         feats = candidate_features(cand_xy, cand_yaw, cfg.future_dt, self.pos_scale, self.vel_scale)
         traj = self.traj_embed(feats.reshape(bsz * count, steps, -1))
-        if cfg.scorer_route_features:
-            r_step = route_step_features(cand_xy, cand_yaw, ctx["route"])
-            traj = traj + self.route_step(r_step).reshape(bsz * count, steps, -1)
-        if cfg.scorer_rule_features:
-            rule_step, rule_end = rule_features(center, cand_yaw, ctx["ego_lw"], ctx["wm"], ctx["statics"], ctx["label_edges"])
-            traj = traj + self.rule_step(rule_step).reshape(bsz * count, steps, -1)
+        r_step = route_step_features(cand_xy, cand_yaw, ctx["route"])
+        rule_step, rule_end = rule_features(center, cand_yaw, ctx["ego_lw"], ctx["wm"], ctx["statics"], ctx["label_edges"])
+        traj = traj + (self.route_step(r_step) + self.rule_step(rule_step)).reshape(bsz * count, steps, -1)
         encoded, _ = self.traj_gru(traj)
         cross, _ = self.cross_attn(encoded.reshape(bsz, count * steps, -1), ctx["tokens"], ctx["tokens"],
                                    key_padding_mask=~ctx["valid"], need_weights=False)
@@ -525,25 +509,18 @@ class PlanScorer(nn.Module):
         wm = ctx["wm"]
         b, a, m, t, _ = wm["xy"].shape
         w_geo = self._wm_geometry(center, cand_yaw, ctx["ego_lw"], wm)
-        mask = (wm["valid"][:, :, None] & (wm["probs"] > 0)).reshape(b, 1, 1, a * m)
-        bias = torch.log(wm["probs"].clamp(min=1e-4)).reshape(b, 1, 1, a * m)
-        if wm.get("slots") is not None:
-            mask, bias = mask[..., wm["slots"]], bias[..., wm["slots"]]
+        mask = (wm["valid"][:, :, None] & (wm["probs"] > 0)).reshape(b, 1, 1, a * m)[..., wm["slots"]]
+        bias = torch.log(wm["probs"].clamp(min=1e-4)).reshape(b, 1, 1, a * m)[..., wm["slots"]]
         w_out = self.wm_attn(q, ctx["wm_tok"], w_geo, bias, mask.expand(b, 1, t, mask.shape[-1]))
         pooled += [x.reshape(bsz * count, -1) for x in _masked_pool(w_out, 2)]
 
         z = self.trunk(torch.cat(pooled, -1))
-        if cfg.scorer_route_features:
-            z = z + self.route_end(route_end_features(cand_xy, ctx["route"], r_step)).reshape(bsz * count, -1)
-        if cfg.scorer_rule_features:
-            z = z + self.rule_end(rule_end).reshape(bsz * count, -1)
+        z = z + (self.route_end(route_end_features(cand_xy, ctx["route"], r_step)) + self.rule_end(rule_end)).reshape(bsz * count, -1)
         # Heads in fp32: bf16 resolves a score of ~10 only to ~0.06, which ties near-equal candidates.
         with torch.autocast(z.device.type, enabled=False):
             z = z.float()
-            aux = {}
-            if cfg.scorer_aux_heads:
-                aux = {"ttv": self.ttv_head(z).squeeze(-1).reshape(bsz, count),
-                       "progress": self.progress_head(z).squeeze(-1).reshape(bsz, count)}
+            aux = {"ttv": self.ttv_head(z).squeeze(-1).reshape(bsz, count),
+                   "progress": self.progress_head(z).squeeze(-1).reshape(bsz, count)}
             return self.total_head(z).squeeze(-1).reshape(bsz, count), self.sub_head(z).reshape(bsz, count, -1), aux
 
 

@@ -78,9 +78,6 @@ class AnchorWMConfig:
     scorer_near_modes: int = 12
     scorer_pos_scale: float = 20.0
     scorer_vel_scale: float = 5.0
-    scorer_route_features: bool = True    # per-step distance / heading error to the route + endpoint progress
-    scorer_rule_features: bool = True     # exact box gaps to the forecast modes + signed drivable-area distance
-    scorer_aux_heads: bool = True         # time-to-violation and route-progress heads
 
     def __post_init__(self) -> None:
         self.edge_box = tuple(float(v) for v in self.edge_box)
@@ -89,16 +86,12 @@ class AnchorWMConfig:
             raise ValueError("scorer_hidden must be divisible by scorer_heads")
         if self.num_out_modes > self.num_anchors or self.scorer_modes > self.num_anchors:
             raise ValueError("num_out_modes and scorer_modes must be <= num_anchors")
-        if self.scorer_near_agents > 0 and not self.scorer_modes <= self.scorer_near_modes <= self.num_anchors:
+        if not self.scorer_modes <= self.scorer_near_modes <= self.num_anchors:
             raise ValueError("scorer_near_modes must be in [scorer_modes, num_anchors]")
         if (self.history_steps - 1) * self.history_stride >= PAST_FRAMES:
             raise ValueError("history does not fit the cached past")
         if self.future_steps * self.future_stride > FUTURE_FRAMES:
             raise ValueError("future does not fit the cached future")
-
-    @property
-    def scorer_modes_max(self) -> int:
-        return max(int(self.scorer_modes), int(self.scorer_near_modes) if self.scorer_near_agents > 0 else 0)
 
     @property
     def agent_feature_dim(self) -> int:

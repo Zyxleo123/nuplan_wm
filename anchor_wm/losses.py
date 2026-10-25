@@ -160,7 +160,7 @@ def _pick_metrics(total: torch.Tensor, labels: dict, valid: torch.Tensor, unsafe
 def score_loss(total: torch.Tensor, sub: torch.Tensor, labels: dict, valid: torch.Tensor, *,
                progress_margin: float = 2.0, w_sub: float = 1.0, w_pair: float = 1.0, w_list: float = 0.5,
                tau_overlap: float = 0.5, tau_offroad: float = 0.5, tau_comfort: float = 0.5,
-               list_temp: float = 1.0, aux: dict | None = None, w_aux: float = 0.5) -> tuple[torch.Tensor, dict]:
+               list_temp: float = 1.0, aux: dict, w_aux: float = 0.5) -> tuple[torch.Tensor, dict]:
     """total [B,C], sub [B,C,4] (overlap, offroad, progress, comfort logits), valid [B,C]."""
     w = valid.float()
     unsafe = labels["overlap"] | labels["offroad"]
@@ -196,18 +196,15 @@ def score_loss(total: torch.Tensor, sub: torch.Tensor, labels: dict, valid: torc
     l_list = (-(target * logp.masked_fill(~valid, 0.0)).sum(-1) * has).sum() / has.sum().clamp_min(1.0)
 
     loss = w_sub * l_sub + w_pair * l_pair + w_list * l_list
-    l_aux = None
-    if aux:
-        l_aux = _aux_loss(aux, labels, valid)
-        loss = loss + w_aux * l_aux
+    l_aux = _aux_loss(aux, labels, valid)
+    loss = loss + w_aux * l_aux
     with torch.no_grad():
         acc_pairs = safety_pairs | prog_pairs
         metrics = {"loss_score": float(loss), "score_sub": float(l_sub), "score_pair": float(l_pair),
                    "score_list": float(l_list),
                    "score_pair_acc": float(_masked_mean((diff > 0).float() + 0.5 * (diff == 0).float(), acc_pairs.float()))}
         metrics.update(_pick_metrics(total, labels, valid, unsafe))
-        if l_aux is not None:
-            metrics["score_aux"] = float(l_aux)
+        metrics["score_aux"] = float(l_aux)
     return loss, metrics
 
 
@@ -223,7 +220,7 @@ def simple_utility(unsafe: torch.Tensor, ttv: torch.Tensor, severity: torch.Tens
 
 def simple_score_loss(total: torch.Tensor, sub: torch.Tensor, labels: dict, valid: torch.Tensor, *,
                       w_safe: float = 1.0, temp: float = 1.0, late: float = 0.5, progress_margin: float = 2.0,
-                      aux: dict | None = None, w_aux: float = 0.5) -> tuple[torch.Tensor, dict]:
+                      aux: dict, w_aux: float = 0.5) -> tuple[torch.Tensor, dict]:
     """Listwise cross-entropy of softmax(S) toward softmax(U / temp) over each group's valid candidates, plus
     BCE of the overlap / offroad sub-logits toward time-weighted violation targets."""
     h = labels["horizon"].float().clamp_min(1.0)[:, None]
@@ -240,10 +237,8 @@ def simple_score_loss(total: torch.Tensor, sub: torch.Tensor, labels: dict, vali
     l_safe = (_bce_soft(sub[..., 0], tw(labels["first_overlap"], labels["overlap"]), w)
               + _bce_soft(sub[..., 1], tw(labels["first_offroad"], labels["offroad"]), w))
     loss = l_list + w_safe * l_safe
-    l_aux = None
-    if aux:
-        l_aux = _aux_loss(aux, labels, valid)
-        loss = loss + w_aux * l_aux
+    l_aux = _aux_loss(aux, labels, valid)
+    loss = loss + w_aux * l_aux
     with torch.no_grad():
         diff = total.float()[:, :, None] - total.float()[:, None, :]
         vv = valid[:, :, None] & valid[:, None, :]
@@ -252,6 +247,5 @@ def simple_score_loss(total: torch.Tensor, sub: torch.Tensor, labels: dict, vali
         metrics = {"loss_score": float(loss), "score_list": float(l_list), "score_safe": float(l_safe),
                    "score_pair_acc": float(_masked_mean((diff > 0).float() + 0.5 * (diff == 0).float(), pairs.float()))}
         metrics.update(_pick_metrics(total, labels, valid, unsafe))
-        if l_aux is not None:
-            metrics["score_aux"] = float(l_aux)
+        metrics["score_aux"] = float(l_aux)
     return loss, metrics

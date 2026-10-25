@@ -89,7 +89,7 @@ scenarios) is about 320 KB per scenario, so the full ~600k-scenario cache is abo
 | Time remaining | episode can end inside the plan (`--time_remaining`) | dropped: nuPlan scenarios always have the 8 s future | |
 | Perturbations | lateral ramps over time; heading = path tangent while still | lateral ramps also faded in over the first 5 m of travel; heading = logged yaw at the same arc length while still | 36% of nuPlan samples have a stopped ego, whose logged path is position jitter: the tangent was random and stopped egos slid sideways, labelling copies of the safe logged future as overlapping |
 | Encoder init | warm start from MF-Gaussian (`--init_ckpt`) | from scratch (encoder lr = decoder lr = 3e-4, joint scorer gradient ramped in after 10k steps over 10k) | no nuPlan MF-Gaussian checkpoint |
-| Defaults | v1 flags; v2 via `RECIPE=v2` | the v2 recipe is the default: route / rule features, aux heads, 32 agents x 6 modes (8 nearest x 12), kernel interaction weight, 0.1 m sigma floor, no decay on norms / biases | single configuration to start from |
+| Recipe | v1 by default, v2 via `RECIPE=v2` | v2 only (no v1 switches): route / rule features, aux heads, 32 agents x 6 modes (8 nearest x 12), kernel interaction weight, 0.1 m sigma floor, no decay on norms / biases | v1 is no longer needed |
 | Split | last 10% of shards | 5% of **logs** (stable hash of the log name) | scenarios of one log overlap in time |
 
 ## Smoke tests (babel, 300-scenario cache from 12 logs)
@@ -101,8 +101,7 @@ scenarios) is about 320 KB per scenario, so the full ~600k-scenario cache is abo
 - Training, 200 steps at batch 16 on an L40S (`SMOKE=1`, 0.1 s / 80 steps), every arm / loss: no non-finite
   steps; val minADE@6 4.1 -> 2.7-3.1 m; joint scorer pairwise accuracy 0.86-0.87 and picked-unsafe
   0.14-0.16 (simple / current loss). 0.44 s/step and 13.7 GB peak with the scorer, 0.03 s/step forecasting
-  only. Resume, `--file_list`, `--use_goal` and the `--no_route_features --no_rule_features --no_aux_heads`
-  ablation also run.
+  only. Resume, `--file_list` and `--use_goal` also run.
 
 ## Known gaps
 
