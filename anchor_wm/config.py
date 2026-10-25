@@ -48,6 +48,14 @@ class AnchorWMConfig:
     route_points: int = 10           # route summary for the ego query / scorer: centreline every 10 m
     route_spacing_m: float = 10.0
     use_goal: bool = False           # also feed the mission goal (off by default: the route is the subgoal)
+    # What the encoder / anchor decoder see of the ego (the scorer always gets its true current velocity):
+    #   history          2 s of ego states, like every agent
+    #   current          the t = 0 state only
+    #   current_dropout  the t = 0 state, its velocity masked for a random `ego_dropout` share of training samples
+    # Ego history and unmasked kinematics make imitation planners copy their own past in closed loop (PlanTF:
+    # NR-CLS 86 -> 57 with history; state dropout 0.75 was its best setting).
+    ego_input: str = "current_dropout"
+    ego_dropout: float = 0.75
 
     # ---- anchor decoder ----
     num_anchors: int = 64            # per anchor group; must match the anchor file
@@ -90,6 +98,8 @@ class AnchorWMConfig:
             raise ValueError("num_out_modes and scorer_modes must be <= num_anchors")
         if not self.scorer_modes <= self.scorer_near_modes <= self.num_anchors:
             raise ValueError("scorer_near_modes must be in [scorer_modes, num_anchors]")
+        if self.ego_input not in ("history", "current", "current_dropout"):
+            raise ValueError(f"ego_input must be history|current|current_dropout, got {self.ego_input!r}")
         if (self.history_steps - 1) * self.history_stride >= PAST_FRAMES:
             raise ValueError("history does not fit the cached past")
         if self.future_steps * self.future_stride > FUTURE_FRAMES:

@@ -106,6 +106,7 @@ on 16 CPUs, which is why the plan step does it once.
 | Scorer route features | per-step distance / heading error to the nearest lane point; goal geometry | per-step distance / heading error to the route centreline; endpoint route progress / distance / heading | route replaces the goal |
 | Time remaining | episode can end inside the plan (`--time_remaining`) | dropped: nuPlan scenarios always have the 8 s future | |
 | Perturbations | lateral ramps over time; heading = path tangent while still | lateral ramps also faded in over the first 5 m of travel; heading = logged yaw at the same arc length while still | 36% of nuPlan samples have a stopped ego, whose logged path is position jitter: the tangent was random and stopped egos slid sideways, labelling copies of the safe logged future as overlapping |
+| Ego input | the SDC is decoded from its 1 s history like any agent; the goal token carries its velocity | `--ego_input current_dropout` (default): encoder / decoder see only the t = 0 ego state, and in training its velocity (also in the plan embedding) is zeroed for 75% of samples; `current` / `history` for ablations. The scorer always gets the true velocity | PlanTF: ego history drops NR-CLS 86 -> 57 (copying its own past); state dropout 0.75 fixes the kinematic shortcut. Diffusion Planner drops ego state entirely; ChauffeurNet used past-motion dropout. The scorer is trained on rule labels, not imitation, and needs the velocity to judge feasibility / comfort |
 | Encoder init | warm start from MF-Gaussian (`--init_ckpt`) | from scratch (encoder lr = decoder lr = 3e-4, joint scorer gradient ramped in after 10k steps over 10k) | no nuPlan MF-Gaussian checkpoint |
 | Recipe | v1 by default, v2 via `RECIPE=v2` | v2 only (no v1 switches): route / rule features, aux heads, 32 agents x 6 modes (8 nearest x 12), kernel interaction weight, 0.1 m sigma floor, no decay on norms / biases | v1 is no longer needed |
 | Split | last 10% of shards | 5% of **logs** (stable hash of the log name) | scenarios of one log overlap in time |
@@ -132,8 +133,8 @@ on 16 CPUs, which is why the plan step does it once.
   count as unsafe (CLS halves the score for the first one).
 - The drivable-area ego-lane exemption is not modelled, and the model does not yet read the lane graph or
   the future traffic lights (they are cached for labels and later inputs).
-- Ego input: the ego token sees 2 s of ego history. PlanTF reports that ego history (and unmasked kinematic
-  state) causes shortcut learning in closed loop; an ego-input switch with state dropout is still to come.
+- Ego-input defaults follow PlanTF's closed-loop ablation; we can only check them once AnchorWM runs as a
+  nuPlan planner (open-loop ego metrics favour `--ego_input history`).
 - Log replay is non-reactive (CLS-NR); agents never react to the candidate.
 - Static objects are taken at their t = 0 pose in the scorer's rule features (labels use the full log).
 - Pedestrians and bicycles use Cartesian anchors like vehicles.

@@ -638,9 +638,26 @@ class AnchorWorldModel(nn.Module):
             "heading_sc": heading_sc,
         }
 
+    def ego_view(self, f: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
+        """The inputs as the encoder / decoder see the ego (cfg.ego_input): its past frames removed and, in
+        training with current_dropout, its current velocity (ego token and plan embedding) zeroed for a random
+        share of the samples. Targets, labels and the scorer keep using the unmodified batch."""
+        mode = self.config.ego_input
+        if mode == "history":
+            return f
+        hist, hvalid = f["agent_history"].clone(), f["agent_history_valid"].clone()
+        hist[:, 0, :-1], hvalid[:, 0, :-1] = 0.0, False                               # slot 0 is the ego
+        g = dict(f, agent_history=hist, agent_history_valid=hvalid)
+        if mode == "current_dropout" and self.training:
+            keep = (torch.rand(hist.shape[0], device=hist.device) >= self.config.ego_dropout).to(hist.dtype)
+            hist[:, 0, -1, 2:4] = hist[:, 0, -1, 2:4] * keep[:, None]                 # vx, vy
+            g["ego_vel"] = f["ego_vel"] * keep[:, None].to(f["ego_vel"].dtype)
+        return g
+
     def forward(self, f: Mapping[str, torch.Tensor]) -> tuple[dict, dict]:
-        enc = self.encode(f)
-        return enc, self.decode(f, enc)
+        g = self.ego_view(f)
+        enc = self.encode(g)
+        return enc, self.decode(g, enc)
 
 
 @torch.no_grad()

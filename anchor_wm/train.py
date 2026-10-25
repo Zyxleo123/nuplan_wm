@@ -81,6 +81,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scorer_near_agents", type=int, default=8)
     p.add_argument("--scorer_near_modes", type=int, default=12)
     p.add_argument("--use_goal", action="store_true", help="also feed the mission goal (ego query and scorer)")
+    p.add_argument("--ego_input", default="current_dropout", choices=("history", "current", "current_dropout"),
+                   help="what the encoder / decoder see of the ego (config.AnchorWMConfig.ego_input)")
+    p.add_argument("--ego_dropout", type=float, default=0.75, help="share of training samples without ego velocity")
     # bookkeeping
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--val_every", type=int, default=2500)
@@ -202,7 +205,7 @@ def build_config(args, num_anchors: int) -> AnchorWMConfig:
                           scorer_hidden=args.scorer_hidden, sigma_eps=args.sigma_eps,
                           scorer_agents=args.scorer_agents, scorer_modes=args.scorer_modes,
                           scorer_near_agents=args.scorer_near_agents, scorer_near_modes=args.scorer_near_modes,
-                          use_goal=args.use_goal)
+                          use_goal=args.use_goal, ego_input=args.ego_input, ego_dropout=args.ego_dropout)
 
 
 def main() -> None:
