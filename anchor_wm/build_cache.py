@@ -80,6 +80,7 @@ from nuplan.database.nuplan_db.nuplan_scenario_queries import get_sensor_token  
 from nuplan.database.utils.label.utils import local2agent_type, raw_mapping  # noqa: E402
 from nuplan.planning.scenario_builder.scenario_utils import sample_indices_with_time_horizon  # noqa: E402
 from nuplan.planning.utils.multithreading.worker_parallel import SingleMachineParallelExecutor  # noqa: E402
+from nuplan.planning.utils.multithreading.worker_sequential import Sequential  # noqa: E402
 from pyquaternion import Quaternion  # noqa: E402
 
 from anchor_wm.config import CACHE_DT, FUTURE_FRAMES, PAST_FRAMES  # noqa: E402
@@ -516,11 +517,27 @@ def _init(args) -> None:
     _ARGS = args
 
 
-def _work_log(scenarios: list) -> dict:
-    """All scenarios of one log: read the log once, then write each scenario's file."""
+def _work_log(task) -> dict:
+    """All scenarios of one log: read the log once, then write each scenario's file. `task` is a list of
+    scenarios, or (log_name, tokens) from a plan (the scenarios are then built here, from that log only)."""
     counts: dict[str, int] = {}
-    todo = [s for s in scenarios if not os.path.exists(cache_file(_ARGS.save_path, s))]
-    counts["exists"] = len(scenarios) - len(todo)
+    if isinstance(task, tuple):
+        log_name, tokens = task
+        todo_tokens = [t for t in tokens if not os.path.exists(os.path.join(_ARGS.save_path, f"{log_name}__{t}.npz"))]
+        counts["exists"] = len(tokens) - len(todo_tokens)
+        if not todo_tokens:
+            return counts
+        try:
+            todo = list_scenarios(_ARGS, [os.path.join(_ARGS.data_path, log_name + ".db")], [log_name], todo_tokens,
+                                  worker=Sequential())
+        except Exception:
+            print(f"FAILED log {log_name}\n{traceback.format_exc()}", flush=True)
+            counts["failed"] = len(todo_tokens)
+            return counts
+        counts["not_found"] = len(todo_tokens) - len(todo)
+    else:
+        todo = [s for s in task if not os.path.exists(cache_file(_ARGS.save_path, s))]
+        counts["exists"] = len(task) - len(todo)
     if not todo:
         return counts
     # The DBs live on NFS: one sequential copy to node-local disk is several times faster than the random
@@ -568,10 +585,10 @@ def scenario_filter(args, log_names: list | None, tokens: list | None = None) ->
         speed_noise_tolerance=None)
 
 
-def list_scenarios(args, db_files: list | None, log_names: list | None, tokens: list | None = None) -> list:
+def list_scenarios(args, db_files: list | None, log_names: list | None, tokens: list | None = None, worker=None) -> list:
     builder = NuPlanScenarioBuilder(args.data_path, args.map_path, None, db_files, args.map_version)
     random.seed(args.seed)
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=args.num_workers)
+    worker = worker or SingleMachineParallelExecutor(use_process_pool=True, max_workers=args.num_workers)
     return sorted(builder.get_scenarios(scenario_filter(args, log_names, tokens), worker), key=lambda s: (s.log_name, s.token))
 
 
@@ -631,8 +648,7 @@ def main() -> None:
                           "scenarios": sum(len(plan[g]) for g in logs), "todo": sum(map(len, todo.values()))}), flush=True)
         if not todo:
             return
-        scenarios = list_scenarios(args, [os.path.join(args.data_path, g + ".db") for g in todo], list(todo),
-                                   [t for ts in todo.values() for t in ts])
+        tasks = list(todo.items())                       # each worker builds its log's scenarios from the tokens
     elif args.make_plan and args.plan_from_list:
         plan = plan_from_list(args, log_names)
         with open(args.plan_file, "w") as fh:
@@ -657,13 +673,14 @@ def main() -> None:
             return
         shard = -(-len(scenarios) // args.num_shards)
         scenarios = scenarios[args.shard_id * shard:(args.shard_id + 1) * shard]
-    print(json.dumps({"scenarios": len(scenarios), "list_s": round(time.time() - t0, 1)}), flush=True)
+        print(json.dumps({"scenarios": len(scenarios), "list_s": round(time.time() - t0, 1)}), flush=True)
+        groups: dict[str, list] = {}
+        for sc in scenarios:
+            groups.setdefault(sc.log_name, []).append(sc)
+        tasks = list(groups.values())
 
     # One task per log (LogData reads it once); largest logs first so the pool's tail is short.
-    groups: dict[str, list] = {}
-    for sc in scenarios:
-        groups.setdefault(sc.log_name, []).append(sc)
-    tasks = sorted(groups.values(), key=len, reverse=True)
+    tasks = sorted(tasks, key=lambda t: len(t[1]) if isinstance(t, tuple) else len(t), reverse=True)
     t0, counts, done = time.time(), {}, 0
     with Pool(args.num_workers, initializer=_init, initargs=(args,), maxtasksperchild=args.max_tasks_per_child) as pool:
         for i, c in enumerate(pool.imap_unordered(_work_log, tasks, chunksize=1)):
