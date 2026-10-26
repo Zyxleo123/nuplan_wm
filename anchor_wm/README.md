@@ -47,15 +47,27 @@ STEP=direct CACHE_DIR=/data/user_data/$USER/anchor_wm_nuplan/cache_smoke \
 # finding each token's log; without --plan_from_list it re-lists every log with the same filter / seed.
 plan=$(STEP=plan EXTRA_ARGS="--plan_from_list diffusion_planner_training.json" sbatch --parsable --cpus-per-task=32 anchor_wm/slurm/cache.sh)
 sbatch --array=0-3 --dependency=afterok:${plan} anchor_wm/slurm/cache.sh
+# Val14 (validation, VAL_CACHE_DIR): its logs are val logs, so no training-log filter
+p=$(STEP=plan CACHE_DIR=$VAL_CACHE_DIR EXTRA_ARGS="--plan_from_list diffusion_planner/config/scenario_filter/val14.yaml \
+    --log_names_json=" sbatch --parsable anchor_wm/slurm/cache.sh)
+CACHE_DIR=$VAL_CACHE_DIR EXTRA_ARGS="--log_names_json=" sbatch --dependency=afterok:$p anchor_wm/slurm/cache.sh
 
 # 2. anchors (train.sh fits them when ANCHORS is missing) + training
 sbatch anchor_wm/slurm/train.sh                          # joint, current loss
 SCORER_LOSS=simple sbatch anchor_wm/slurm/train.sh       # joint, simple loss
 ARM=separate sbatch anchor_wm/slurm/train.sh             # scorer on detached WM outputs
 SMOKE=1 CACHE_DIR=... ANCHORS=... bash anchor_wm/slurm/train.sh   # 200 steps inside an allocation
+# score a checkpoint on Val14 (its own config / args)
+python -m anchor_wm.train --eval_only --resume <run>/final.pt --val_cache_dir $VAL_CACHE_DIR
 ```
 
 Train on a subset of the cache with `--file_list subset.json` (a JSON list of cache file names).
+
+Validation is Val14: the 1,118 scenarios of `diffusion_planner/config/scenario_filter/val14.yaml` from nuPlan's val
+logs, which no training log shares (the split closed-loop results are reported on, balanced over 14 scenario
+types). Training and the anchor fit use every file of the training cache; `train.sh` stops when `VAL_CACHE_DIR` is
+missing. Without `--val_cache_dir`, `--val_fraction` holds out a share of the training logs instead (small test
+caches; a fixed random `--val_batches` sample of them).
 
 ## Cache
 
@@ -90,6 +102,7 @@ Files are named `<log_name>__<token>.npz` so the split needs no file reads. A sc
 | Size | 363 GB |
 | Build | 2026-10-25, code at `63040c3`: 4 array tasks x 16 CPUs (preempt CPU QoS), ~2.5 h each, 0.035-0.038 s / scenario |
 | Access | group `jeff4_group` (read + write; nothing outside the group) |
+| Val14 | `/data/user_data/ishanj/anchor_wm_nuplan/cache_val14`: all 1,118 scenarios (328 val logs), 398 MB |
 
 34 scenarios first failed on the empty-object case fixed in `63040c3` (objects in the log, none within
 120 m) and were rebuilt by a second pass of the same array, which only fills missing files. A preempted
@@ -130,7 +143,7 @@ on 16 CPUs, which is why the plan step does it once.
 | Ego input | the SDC is decoded from its 1 s history like any agent; the goal token carries its velocity | `--ego_input current_dropout` (default): encoder / decoder see only the t = 0 ego state, and in training its velocity (also in the plan embedding) is zeroed for 75% of samples; `current` / `history` for ablations. The scorer always gets the true velocity | PlanTF: ego history drops NR-CLS 86 -> 57 (copying its own past); state dropout 0.75 fixes the kinematic shortcut. Diffusion Planner drops ego state entirely; ChauffeurNet used past-motion dropout. The scorer is trained on rule labels, not imitation, and needs the velocity to judge feasibility / comfort |
 | Encoder init | warm start from MF-Gaussian (`--init_ckpt`) | from scratch (encoder lr = decoder lr = 3e-4, joint scorer gradient ramped in after 10k steps over 10k) | no nuPlan MF-Gaussian checkpoint |
 | Recipe | v1 by default, v2 via `RECIPE=v2` | v2 only (no v1 switches): route / rule features, aux heads, 32 agents x 6 modes (8 nearest x 12), kernel interaction weight, 0.1 m sigma floor, no decay on norms / biases | v1 is no longer needed |
-| Split | last 10% of shards | 5% of **logs** (stable hash of the log name) | scenarios of one log overlap in time |
+| Split | last 10% of shards | **Val14** from nuPlan's val logs (`--val_cache_dir`); `--val_fraction` holds out training logs by a stable hash of the log name instead | Val14 is the split closed-loop results are reported on; scenarios of one log overlap in time, so any held-out share is whole logs |
 
 ## Smoke tests (babel, 300-scenario cache from 12 logs)
 

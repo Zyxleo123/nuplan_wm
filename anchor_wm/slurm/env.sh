@@ -9,6 +9,7 @@ export NUPLAN_MAPS_ROOT="${NUPLAN_MAPS_ROOT:-/data/datasets/nuPlan-v1.1/maps}"
 export OUT_ROOT="${OUT_ROOT:-/data/user_data/${USER}/anchor_wm_nuplan}"
 export CACHE_DIR="${CACHE_DIR:-${OUT_ROOT}/cache}"
 export PLAN_FILE="${PLAN_FILE:-${CACHE_DIR}/plan.json}"
+export VAL_CACHE_DIR="${VAL_CACHE_DIR:-${OUT_ROOT}/cache_val14}"   # Val14 (validation; README, Running)
 export ANCHORS="${ANCHORS:-${OUT_ROOT}/anchors/anchors_k64.npz}"
 export WANDB_PROJECT="${WANDB_PROJECT:-anchor_wm_nuplan}"
 export WANDB_ENTITY="${WANDB_ENTITY-scbellad2025-carnegie-mellon-university}"

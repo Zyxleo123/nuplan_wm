@@ -13,6 +13,7 @@
 #   SCORER_LOSS=current|simple   scorer loss (default current)
 #   ARM=joint|separate|wm_only   scorer gradients reach the WM / detached / no scorer (default joint)
 #   SMOKE=1                      200 steps, frequent validation, no wandb (inside an allocation: bash anchor_wm/slurm/train.sh)
+#   VAL_CACHE_DIR=...            validation cache (default: Val14, env.sh); training uses all of CACHE_DIR
 #
 #   sbatch anchor_wm/slurm/train.sh
 #   SCORER_LOSS=simple sbatch anchor_wm/slurm/train.sh
@@ -20,8 +21,12 @@
 set -euo pipefail
 source "${ROOT:-${SLURM_SUBMIT_DIR:-${PWD}}}/anchor_wm/slurm/env.sh"
 
+if [[ ! -d "${VAL_CACHE_DIR}" ]]; then
+  echo "ERROR: no validation cache ${VAL_CACHE_DIR}; build Val14 first (README, Running)" >&2; exit 1
+fi
 if [[ ! -f "${ANCHORS}" ]]; then
-  python -m anchor_wm.anchors --cache_dir "${CACHE_DIR}" --out "${ANCHORS%.npz}" --num_anchors 64
+  python -m anchor_wm.anchors --cache_dir "${CACHE_DIR}" --val_cache_dir "${VAL_CACHE_DIR}" --out "${ANCHORS%.npz}" \
+    --num_anchors 64
 fi
 
 ARM="${ARM:-joint}"
@@ -42,4 +47,4 @@ fi
 python -m anchor_wm.train --cache_dir "${CACHE_DIR}" --anchors "${ANCHORS}" --save_dir "${OUT_ROOT}/runs" \
   --run_name "${RUN_NAME}" --scorer_loss "${SCORER_LOSS}" "${ARM_ARGS[@]}" "${ARGS[@]}" \
   --num_workers "${NUM_WORKERS:-12}" --wandb_project "${WANDB_PROJECT}" --wandb_entity "${WANDB_ENTITY}" \
-  --wandb_mode "${WANDB_MODE:-online}" ${RESUME:+--resume "${RESUME}"} ${EXTRA_ARGS:-}
+  --wandb_mode "${WANDB_MODE:-online}" ${RESUME:+--resume "${RESUME}"} --val_cache_dir "${VAL_CACHE_DIR}" ${EXTRA_ARGS:-}

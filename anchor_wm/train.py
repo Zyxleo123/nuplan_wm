@@ -35,10 +35,10 @@ from anchor_wm.model import ENCODER_PREFIXES, AnchorWorldModel
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--cache_dir", required=True)
+    p.add_argument("--cache_dir", default="", help="required for training")
     p.add_argument("--file_list", default="", help="JSON list of cache files (default: every npz in cache_dir)")
-    p.add_argument("--anchors", required=True, help="npz from anchor_wm.anchors")
-    p.add_argument("--save_dir", required=True)
+    p.add_argument("--anchors", default="", help="npz from anchor_wm.anchors; required for training")
+    p.add_argument("--save_dir", default="", help="required for training")
     p.add_argument("--run_name", default="anchor_wm")
     p.add_argument("--resume", default="")
     p.add_argument("--device", default="cuda")
@@ -47,7 +47,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_hours", type=float, default=0.0, help="stop (and save) after this wall time; 0 = off")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--val_fraction", type=float, default=0.05, help="share of logs held out")
+    p.add_argument("--val_cache_dir", default="",
+                   help="validate on every file of this cache (Val14) and train on all of --cache_dir")
+    p.add_argument("--val_fraction", type=float, default=0.0,
+                   help="instead of --val_cache_dir: hold out this share of the training logs (e.g. small test caches)")
+    p.add_argument("--eval_only", action="store_true",
+                   help="validate the --resume checkpoint on --val_cache_dir (its own config / args) and exit")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--encoder_lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
@@ -96,7 +101,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb_project", default="anchor_wm_nuplan")
     p.add_argument("--wandb_entity", default="")
     p.add_argument("--wandb_mode", default="online")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.eval_only and not (args.cache_dir and args.anchors and args.save_dir):
+        p.error("training needs --cache_dir, --anchors and --save_dir")
+    if not args.eval_only and not args.profile_steps and not (args.val_cache_dir or args.val_fraction > 0):
+        p.error("training needs a validation set: --val_cache_dir (Val14) or --val_fraction")
+    return args
 
 
 def joint_scale(args, step: int) -> float:
@@ -208,6 +218,26 @@ def build_config(args, num_anchors: int) -> AnchorWMConfig:
                           use_goal=args.use_goal, ego_input=args.ego_input, ego_dropout=args.ego_dropout)
 
 
+def evaluate(args, device: torch.device, amp: bool) -> None:
+    """--eval_only: the checkpoint's model, config and scorer args on every file of --val_cache_dir; prints the
+    metrics and writes <checkpoint>_eval_<cache name>.json next to the checkpoint."""
+    if not (args.resume and args.val_cache_dir):
+        raise SystemExit("--eval_only needs --resume and --val_cache_dir")
+    ck = torch.load(args.resume, map_location="cpu")
+    run_args = argparse.Namespace(**ck["args"])
+    cfg = AnchorWMConfig.from_dict(ck["config"])
+    model = AnchorWorldModel(cfg, torch.from_numpy(np.load(ck["anchors"])["anchors"])).to(device)
+    model.load_state_dict(ck["model"])
+    files = resolve_files(args.val_cache_dir)
+    loader = make_loader(files, cfg, batch_size=args.batch_size, shuffle=False, seed=0, num_workers=args.num_workers)
+    vm = validate(model, loader, run_args, cfg, device, amp, joint_scale(run_args, int(ck["step"])))
+    out = {"checkpoint": args.resume, "step": int(ck["step"]), "val_cache_dir": args.val_cache_dir,
+           "files": len(files), "val": {k: round(v, 4) for k, v in vm.items()}}
+    print(json.dumps(out), flush=True)
+    path = Path(args.resume)
+    (path.parent / f"{path.stem}_eval_{Path(args.val_cache_dir).name}.json").write_text(json.dumps(out, indent=1))
+
+
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
@@ -215,6 +245,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     amp = device.type == "cuda" and not args.no_amp and torch.cuda.is_bf16_supported()
+    if args.eval_only:
+        evaluate(args, device, amp)
+        return
 
     anchors = torch.from_numpy(np.load(args.anchors)["anchors"])
     cfg = build_config(args, int(anchors.shape[1]))
@@ -235,7 +268,11 @@ def main() -> None:
         opt.load_state_dict(ck["optimizer"])
         step = int(ck["step"])
 
-    train_files, val_files = split_files(resolve_files(args.cache_dir, args.file_list), args.val_fraction)
+    files = resolve_files(args.cache_dir, args.file_list)
+    if args.val_cache_dir:
+        train_files, val_files = files, resolve_files(args.val_cache_dir)
+    else:
+        train_files, val_files = split_files(files, args.val_fraction)
     loader = make_loader(train_files, cfg, batch_size=args.batch_size, shuffle=True, seed=args.seed + step,
                          num_workers=args.num_workers)
     batches = infinite(loader)
@@ -250,9 +287,11 @@ def main() -> None:
                 "train_files": len(train_files), "val_files": len(val_files)}
         (run_dir / "config.json").write_text(json.dumps(meta, indent=1, default=str))
         print(json.dumps(meta, default=str), flush=True)
+        # The same batches every time: all of --val_cache_dir, or a fixed random sample of the held-out logs (file
+        # order would put only the first ~20 logs, by date, in val_batches).
         val_batches = []
-        for i, b in enumerate(make_loader(val_files, cfg, batch_size=args.batch_size, shuffle=False, seed=0,
-                                          num_workers=min(args.num_workers, 2))):
+        for i, b in enumerate(make_loader(val_files, cfg, batch_size=args.batch_size, shuffle=not args.val_cache_dir,
+                                          seed=0, num_workers=min(args.num_workers, 2))):
             if i >= args.val_batches:
                 break
             val_batches.append(b)

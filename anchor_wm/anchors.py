@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
@@ -41,16 +42,22 @@ def agent_frame_futures(z, cfg: AnchorWMConfig) -> tuple[np.ndarray, np.ndarray]
     return local.astype(np.float32), a["type"][ok].astype(np.int64)
 
 
-def collect(files, cfg, max_per_group: int, seed: int) -> dict:
+def _file_futures(args) -> tuple[np.ndarray, np.ndarray]:
+    path, cfg = args
+    with np.load(path) as z:
+        return agent_frame_futures(z, cfg)
+
+
+def collect(files, cfg, max_per_group: int, seed: int, num_workers: int) -> dict:
+    """Reads in parallel: a cold cache file takes ~0.3 s on NFS, almost all of it latency."""
     rng = np.random.default_rng(seed)
     bank = {g: [] for g in range(len(ANCHOR_GROUPS))}
-    for i, p in enumerate(files):
-        with np.load(p) as z:
-            fut, grp = agent_frame_futures(z, cfg)
-        for g in bank:
-            bank[g].append(fut[grp == g])
-        if (i + 1) % 1000 == 0:
-            print(f"read {i + 1}/{len(files)} files", flush=True)
+    with Pool(num_workers) as pool:
+        for i, (fut, grp) in enumerate(pool.imap(_file_futures, [(p, cfg) for p in files], chunksize=16)):
+            for g in bank:
+                bank[g].append(fut[grp == g])
+            if (i + 1) % 10000 == 0:
+                print(f"read {i + 1}/{len(files)} files", flush=True)
     out = {}
     for g in bank:
         arr = np.concatenate(bank[g]) if bank[g] else np.zeros((0, cfg.future_steps, 2), np.float32)
@@ -125,21 +132,28 @@ def main() -> None:
     p.add_argument("--num_anchors", type=int, default=64)
     p.add_argument("--max_train_files", type=int, default=50000)
     p.add_argument("--max_val_files", type=int, default=5000)
-    p.add_argument("--val_fraction", type=float, default=0.05)
+    p.add_argument("--val_cache_dir", default="", help="oracle report on this cache (Val14); fit on all of --cache_dir")
+    p.add_argument("--val_fraction", type=float, default=0.0,
+                   help="instead of --val_cache_dir: hold out this share of the training logs for the report")
     p.add_argument("--max_per_group", type=int, default=300000)
     p.add_argument("--iters", type=int, default=60)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--num_workers", type=int, default=16, help="file-reading processes")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
     cfg = AnchorWMConfig(num_anchors=args.num_anchors)
-    train_files, val_files = split_files(resolve_files(args.cache_dir, args.file_list), args.val_fraction)
+    files = resolve_files(args.cache_dir, args.file_list)
+    if args.val_cache_dir:
+        train_files, val_files = files, resolve_files(args.val_cache_dir)
+    else:
+        train_files, val_files = split_files(files, args.val_fraction)
     rng = np.random.default_rng(args.seed)
     train_files = [train_files[i] for i in sorted(rng.choice(len(train_files), min(args.max_train_files, len(train_files)), replace=False))]
     val_files = val_files[:args.max_val_files]
     t0 = time.time()
-    train = collect(train_files, cfg, args.max_per_group, args.seed)
-    val = collect(val_files, cfg, args.max_per_group, args.seed + 1)
+    train = collect(train_files, cfg, args.max_per_group, args.seed, args.num_workers)
+    val = collect(val_files, cfg, args.max_per_group, args.seed + 1, args.num_workers)
     g_count = len(ANCHOR_GROUPS)
     anchors = np.zeros((g_count, args.num_anchors, cfg.future_steps, 2), np.float32)
     counts = np.zeros((g_count, args.num_anchors), np.int64)

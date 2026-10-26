@@ -66,6 +66,7 @@ from multiprocessing import Pool  # noqa: E402
 
 import numpy as np  # noqa: E402
 import shapely  # noqa: E402
+import yaml  # noqa: E402
 from shapely.geometry import Polygon, box  # noqa: E402
 from shapely.ops import orient, unary_union  # noqa: E402
 
@@ -128,7 +129,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--make_plan", action="store_true", help="list the scenarios, write --plan_file and exit")
     p.add_argument("--plan_from_list", default="",
                    help="with --make_plan: take the scenarios from an existing file list (<map>_<token>.npz names, e.g. "
-                        "Diffusion-Planner's diffusion_planner_training.json) instead of listing them")
+                        "Diffusion-Planner's diffusion_planner_training.json) or a scenario-filter YAML with "
+                        "scenario_tokens (val14.yaml; add --log_names_json '' since its logs are not training logs) "
+                        "instead of listing them")
     p.add_argument("--max_tasks_per_child", type=int, default=20,
                    help="restart workers after this many logs (bounds the devkit's map-object cache)")
     p.add_argument("--seed", type=int, default=0)
@@ -603,11 +606,19 @@ def _log_tokens(db_file: str) -> tuple:
         con.close()
 
 
+def listed_tokens(path: str) -> set:
+    """Scenario tokens of a JSON list of <map>_<token>.npz names (Diffusion-Planner's training list) or of a nuplan
+    scenario-filter YAML with `scenario_tokens` (e.g. diffusion_planner/config/scenario_filter/val14.yaml)."""
+    with open(path) as fh:
+        if path.endswith((".yaml", ".yml")):
+            return {str(t) for t in yaml.safe_load(fh)["scenario_tokens"]}
+        return {os.path.basename(n)[:-4].rsplit("_", 1)[1] for n in json.load(fh)}
+
+
 def plan_from_list(args, log_names: list | None) -> dict:
-    """{log_name: [tokens]} for the scenarios of an existing <map>_<token>.npz list: each token is found in its
+    """{log_name: [tokens]} for the scenarios of an existing list (listed_tokens): each token is found in its
     log's lidar_pc table."""
-    with open(args.plan_from_list) as fh:
-        wanted = {os.path.basename(n)[:-4].rsplit("_", 1)[1] for n in json.load(fh)}
+    wanted = listed_tokens(args.plan_from_list)
     dbs = sorted(glob.glob(os.path.join(args.data_path, "*.db")))
     if log_names is not None:
         keep = set(log_names)
