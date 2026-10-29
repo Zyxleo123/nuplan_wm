@@ -1,0 +1,38 @@
+diffusion_planner_repair:
+  _target_: posthoc_repair.planner.RepairedDiffusionPlanner
+  _convert_: "all"
+
+  config:
+    _target_: diffusion_planner.utils.config.Config
+    _convert_: "all"
+
+    args_file: ???
+
+    guidance_fn: null
+  ckpt_path: ???
+
+  past_trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: "all"
+
+    num_poses: 20
+    time_horizon: 2
+
+  future_trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: "all"
+
+    num_poses: 80
+    time_horizon: 8
+
+  device: cuda
+
+  # posthoc_repair: o_am on Diffusion Planner's plan (posthoc_repair/optimizer.py)
+  neighbor_forecast: cv     # cv | dp (Diffusion Planner's own neighbour prediction) | anchor | none
+  anchor_ckpt: null         # anchor_wm.train checkpoint, for neighbor_forecast: anchor
+  repair_device: cpu
+  object_radius_m: 60.0
+  repair: {}                # RepairConfig overrides, e.g. {window: 20, agent_margin_m: 0.75}
+  stats_dir: null           # one JSON line per replan, one file per scenario
+  enable_repair: true       # false: Diffusion Planner alone, same (seeded) sampling
+  seed: 0                   # per-replan sampling seed; null = unseeded, as diffusion_planner
