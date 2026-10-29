@@ -1,11 +1,11 @@
-"""Pool the chunked runs of posthoc_repair/sim/run_chunks.sh (RUN_ROOT/CHALLENGE/ARM/chunk_*) into one table per
+"""Pool the chunked runs of sim/run_chunks.sh (RUN_ROOT/CHALLENGE/ARM/chunk_*) into one table per
 arm, paired against a base arm.
 
 The score is nuPlan's per-scenario CLS score (the aggregator's ``score`` column); the split score is their mean
 over scenarios, which is what the weighted-average aggregator's ``final_score`` row is for one run (checked per
 chunk). Paired differences are over the scenarios both arms finished, with a bootstrap CI over scenarios.
 
-    python -m posthoc_repair.sim.readout \
+    python -m sim.readout \
         --run_root /data/user_data/$USER/nuplan_wm/runs/val14/closed_loop_nonreactive_agents --base dp
 """
 
@@ -58,6 +58,26 @@ def repair_stats(arm_dir: str) -> dict | None:
             "ms_p50": float(s["ms"].median()), "ms_p99": float(s["ms"].quantile(0.99))}
 
 
+def es_stats(arm_dir: str) -> dict | None:
+    files = glob.glob(os.path.join(arm_dir, "chunk_*", "es_stats", "*.jsonl"))
+    if not files:
+        return None
+    s = pd.DataFrame([json.loads(line) for f in files for line in open(f)])
+    born = s["born"].value_counts(normalize=True).sort_index()
+    return {"simulations": len(files), "replans": len(s),
+            # the scorer's gain of the chosen plan over the first population's sample 0 / best
+            "gain_vs_sample0_p50": float((s["best"] - s["score0"]).median()),
+            "gain_vs_best0_p50": float((s["best"] - s["best0"]).median()),
+            # Diffusion Planner's first-population spread: ~0 means ES has nothing to select among
+            "spread0_m_p50": float(s["spread0_m"].median()), "spread0_end_m_p50": float(s["spread0_end_m"].median()),
+            "chosen_after_iter0": float((s["born"] > 0).mean()),
+            "born": {int(k): round(float(v), 4) for k, v in born.items()},
+            "chosen_repaired": float(s["moved"].mean()),
+            "charged_per_replan": float(s["charged"].mean()), "repaired_per_replan": float(s["repaired"].mean()),
+            "ms_p50": float(s["ms"].median()), "ms_p99": float(s["ms"].quantile(0.99)),
+            **{f"{k}_p50": float(s[k].median()) for k in ("ms_sample", "ms_repair", "ms_score", "ms_scene", "ms_wm")}}
+
+
 def paired(a: pd.DataFrame, b: pd.DataFrame, seed: int = 0, n_boot: int = 10000) -> dict:
     cols = ["scenario", "score"] + [k for k in METRICS if k in a and k in b]
     m = a[cols + ["scenario_type"]].merge(b[cols], on="scenario", suffixes=("_a", "_b"))
@@ -96,6 +116,7 @@ def main() -> None:
             rec["score"] = float(df["score"].mean())
             rec.update({k: float(df[k].mean()) for k in METRICS if k in df})
         rec["repair"] = repair_stats(os.path.join(args.run_root, arm))
+        rec["es"] = es_stats(os.path.join(args.run_root, arm))
         out["arms"][arm] = rec
     if args.base in data and len(data[args.base]):
         for arm in arms:
@@ -122,6 +143,16 @@ def main() -> None:
                          f"({100 * r['violation_cleared']:.0f}% of violating plans cleared); shift p50 {r['shift_m_p50_when_moved']:.2f} m / p95 "
                          f"{r['shift_m_p95_when_moved']:.2f} m; {r['ms_p50']:.1f} ms p50, {r['ms_p99']:.0f} ms p99; "
                          f"nonfinite {r['nonfinite']}")
+        if rec["es"]:
+            e = rec["es"]
+            lines.append(f"\n{arm} ES: {e['replans']} replans in {e['simulations']} simulations; population spread p50 "
+                         f"{e['spread0_m_p50']:.3f} m (endpoint {e['spread0_end_m_p50']:.3f} m); chosen plan born after "
+                         f"the first population {100 * e['chosen_after_iter0']:.1f}% (by round {e['born']}), repaired "
+                         f"{100 * e['chosen_repaired']:.1f}%; score gain p50 vs sample 0 {e['gain_vs_sample0_p50']:+.3f}, "
+                         f"vs best of round 0 {e['gain_vs_best0_p50']:+.3f}; repair charged {e['charged_per_replan']:.1f} / "
+                         f"moved {e['repaired_per_replan']:.1f} candidates per replan; {e['ms_p50']:.0f} ms p50 (sample "
+                         f"{e['ms_sample_p50']:.0f}, repair {e['ms_repair_p50']:.0f}, score {e['ms_score_p50']:.0f}, scene "
+                         f"{e['ms_scene_p50']:.0f}, WM {e['ms_wm_p50']:.0f}), {e['ms_p99']:.0f} ms p99")
         vs = rec.get("vs_" + args.base)
         if vs and vs["changed"]:
             lines.append(f"\n{arm} vs {args.base}, scenarios whose score changed (largest first; metric: base -> arm):")

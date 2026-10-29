@@ -21,9 +21,10 @@ Planner. There is no rule on top: one objective decides whether and where the pl
 | `planner.py` | `RepairedDiffusionPlanner`: Diffusion Planner + repair; seeded sampling; per-replan JSONL stats |
 | `check.py` | behavioural gates on a synthetic road (`PYTHONPATH=. python -m posthoc_repair.check`) |
 | `check_anchor_inputs.py` | online vs cached AnchorWM inputs on Val14 scenarios at t = 0, + a random-init forward through the repair |
-| `sim/split_filter.py` | a token-list scenario filter (Val14) -> chunk filters with their own `log_names` |
-| `sim/run_chunks.sh` | one arm over the chunks, resumable (done-markers), sbatch or inside an allocation |
-| `sim/readout.py` | pooled per-arm CLS table, paired vs a base arm, repair stats |
+| `anchor_model.py` | AnchorWM at planning time, nuPlan-free: one forward per replan, then its forecast and its scorer (`diffusion_es` uses the scorer) |
+
+The closed-loop runner (chunk filters, `run_chunks.sh`, `readout.py`) is in the top-level `sim/`, shared by every
+arm with or without the repair; Diffusion-ES + the AnchorWM scorer (+ this repair) is `diffusion_es/`.
 
 Planner config: `diffusion_planner/config/planner/diffusion_planner_repair.yaml` (`planner=diffusion_planner_repair`;
 `neighbor_forecast: cv | dp | anchor | none`, `anchor_ckpt` for `anchor`, `repair: {...}` overrides `RepairConfig`,
@@ -69,12 +70,12 @@ Margins (edge 0.3 m, agent 0.75 m) are o_am's WOMD expert calibration; they have
 
 ```bash
 # chunk filters for Val14 (token -> log lookup over the val logs, ~4 min)
-python -m posthoc_repair.sim.split_filter --filter diffusion_planner/config/scenario_filter/val14.yaml \
+python -m sim.split_filter --filter diffusion_planner/config/scenario_filter/val14.yaml \
     --data_root /data/datasets/nuPlan-v1.1/nuplan-v1.1/splits/trainval --out /data/user_data/$USER/nuplan_wm/filters/val14
 # arms (sbatch from the repo root, or bash inside an allocation with WORKERS=<cpus>)
-sbatch posthoc_repair/sim/run_chunks.sh ARM=base
-sbatch posthoc_repair/sim/run_chunks.sh ARM=repair_cv
-python -m posthoc_repair.sim.readout --run_root /data/user_data/$USER/nuplan_wm/runs/val14/closed_loop_nonreactive_agents --base base
+sbatch sim/run_chunks.sh ARM=base
+sbatch sim/run_chunks.sh ARM=repair_cv
+python -m sim.readout --run_root /data/user_data/$USER/nuplan_wm/runs/val14/closed_loop_nonreactive_agents --base base
 # AnchorWM forecast: REPAIR="planner.diffusion_planner_repair.anchor_ckpt=<run>/final.pt"  ARM=repair_anchor
 ```
 

@@ -5,7 +5,7 @@ Each chunk filter is the source filter with ``scenario_tokens`` cut down to the 
 every log of the split. Every log's tokens stay in one chunk, so the filter's per-log rules
 (``timestamp_threshold_s``) select the same scenarios as one unchunked run.
 
-    python -m posthoc_repair.sim.split_filter --filter diffusion_planner/config/scenario_filter/val14.yaml \
+    python -m sim.split_filter --filter diffusion_planner/config/scenario_filter/val14.yaml \
         --data_root /data/datasets/nuPlan-v1.1/nuplan-v1.1/splits/trainval --out DIR --chunks 16
 """
 

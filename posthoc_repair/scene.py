@@ -75,6 +75,25 @@ class DrivableArea:
         out["edge_valid"] = torch.as_tensor(valid, device=device)[None]
         return out
 
+    def cache_arrays(self, map_api, pose: np.ndarray, crop_m: float = 150.0, max_points: int = 8192) -> dict:
+        """The cache's ``da_*`` (``drivable_area_arrays(map_api, pose, crop_m, max_points)``, build_cache's
+        ``--da_radius`` / ``--max_da_points``): points in the frame of ``pose`` inside its ``+-crop_m`` square,
+        float32, capped to the ``max_points`` nearest in ring order. Every point of that square must be within
+        ``radius_m - refresh_m`` of the build centre, so build this instance with ``radius_m >= sqrt(2) crop_m +
+        refresh_m``."""
+        if (self._centre is None or self._map != map_api.map_name
+                or np.hypot(*(pose[:2] - self._centre)) > self.refresh_m):
+            self._build(map_api, pose[:2])
+        a = self._arr
+        xy = to_ego(a["da_xy"] + self._centre, pose)
+        keep = np.flatnonzero((np.abs(xy) <= crop_m).all(-1))
+        if len(keep) > max_points:
+            keep = np.sort(keep[np.argsort(np.hypot(xy[keep, 0], xy[keep, 1]), kind="stable")[:max_points]])
+        out = {"da_xy": xy[keep], "da_dir": rotate(a["da_dir"][keep], pose[2]),
+               "da_prev_dir": rotate(a["da_prev_dir"][keep], pose[2]),
+               "da_len": a["da_len"][keep], "da_prev_len": a["da_prev_len"][keep]}
+        return {k: v.astype(np.float32) for k, v in out.items()}
+
 
 def current_objects(observation, pose: np.ndarray, radius_m: float) -> dict:
     """Every tracked object within ``radius_m`` of the ego, ego frame: box centre ``xy [M, 2]``, ``yaw [M]``,
