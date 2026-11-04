@@ -15,11 +15,14 @@ Planner. There is no rule on top: one objective decides whether and where the pl
 
 | File | What it does |
 |---|---|
-| `optimizer.py` | `RepairConfig` (o_am's constants), comfort Hessian, the edit (lateral offset + path retime), hinge^2 barriers, exact box gap, `PosthocRepair` |
-| `scene.py` | online scene in the ego frame: drivable-area boundary (`anchor_wm.build_cache.drivable_area_arrays`, cached and rebuilt every 25 m), object boxes over the window (constant velocity, or a model's per-agent modes weighted by probability) |
+| `optimizer.py` | `RepairConfig` (o_am's constants), comfort Hessian, the edit (lateral offset + path retime), hinge^2 barriers, exact box gap, `PosthocRepair`; the nuPlan terms (TTC, speed limit, scoring the tracked rollout), off by default |
+| `tracker.py` | nuPlan's closed-loop controller (`LQRTracker` + `KinematicBicycleModel`) in torch: what the simulator executes when it tracks a plan, differentiable in the plan |
+| `scene.py` | online scene in the ego frame: drivable-area boundary (`anchor_wm.build_cache.drivable_area_arrays`, cached and rebuilt every 25 m), object boxes over the window (constant velocity, or a model's per-agent modes weighted by probability) with their velocities, the speed limit where the ego is |
 | `anchor_forecast.py` | AnchorWM online: `PlannerInput` -> the cache's per-scenario dict (the cache's own functions) -> `build_sample` -> model -> NMS modes |
 | `planner.py` | `RepairedDiffusionPlanner`: Diffusion Planner + repair; seeded sampling; per-replan JSONL stats |
 | `check.py` | behavioural gates on a synthetic road (`PYTHONPATH=. python -m posthoc_repair.check`) |
+| `check_tracker.py` | `tracker.py` against nuPlan's own controller on random plans (needs nuPlan, no data) |
+| `check_ttc.py` | gates for the TTC / speed-limit / rear-agent terms; `--reference <old optimizer.py>`: the defaults repair bit-identically to it |
 | `check_anchor_inputs.py` | online vs cached AnchorWM inputs on Val14 scenarios at t = 0, + a random-init forward through the repair |
 | `anchor_model.py` | AnchorWM at planning time, nuPlan-free: one forward per replan, then its forecast and its scorer (`diffusion_es` uses the scorer) |
 
@@ -28,7 +31,9 @@ arm with or without the repair; Diffusion-ES + the AnchorWM scorer (+ this repai
 
 Planner config: `diffusion_planner/config/planner/diffusion_planner_repair.yaml` (`planner=diffusion_planner_repair`;
 `neighbor_forecast: cv | dp | anchor | none`, `anchor_ckpt` for `anchor`, `repair: {...}` overrides `RepairConfig`,
-`enable_repair: false` for the same planner without the repair, `seed` for the per-replan sampling seed).
+`enable_repair: false` for the same planner without the repair, `seed` for the per-replan sampling seed). The
+config's `repair: {}` is empty, so a key is set from the command line with `++`, e.g.
+`++planner.diffusion_planner_repair.repair.track=true` (`repair={track:true}` is refused by Hydra).
 
 Diffusion Planner samples its noise from an unseeded `torch.randn`, so two runs of it differ. The repair planner
 seeds every replan from the scenario's start time and the iteration: two `enable_repair: false` runs are
@@ -94,6 +99,72 @@ fixed 2 drivable-area failures (predicted -0.59 / -0.27 m -> +0.24 m) and 1 coll
 an unclearable pickup/dropoff scene (large edits, ended off the drivable area), an edge-for-agent trade that still
 collided, margin-only nudges that cost TTC and comfort, and a swerve that cleared an overlap through the oncoming
 lane (`driving_direction_compliance`; nuPlan's drivable area includes oncoming lanes, so the edge term allows it).
+
+## nuPlan terms (2026-11-03): the tracked rollout, TTC, speed limit
+
+Where o_am still loses points on nuPlan (FlowDrive + `repair_cv`, Val14, read from the simulation logs with nuPlan's own
+metric code; `tune/` on autonlab scratch):
+
+* **TTC is the largest loss** (1.6 points). 60 of 87 TTC failures are against stopped objects (parked cars, cones,
+  generic objects) ahead of the ego's heading, at a projected hit of exactly 0.9 s (the metric fails one within
+  0.95 s): the ego closes at 4-5 m/s on something 4 m away. Every barrier scores positions, so such a plan is clear of
+  every margin.
+* **The executed ego is not the plan.** In half of the at-fault collisions the repaired plan cleared the object by
+  0.1-0.7 m at every replan up to the impact. nuPlan's LQR tracker restarts its reference at the ego every step and
+  follows only the plan's smoothed curvature and its speed 1 s ahead: on one fixed plan it covers ~20% of a 0.5-0.9 m
+  lateral offset in 1 s, and at 3 m/s a 1 m offset of the plan moves the ego 0.07-0.1 m in 1 s and 0.45 m in 2 s
+  (12 m/s: 0.24 / 1.07 m); a speed change is followed within ~1 s. The fixed-plan rollout is within ~0.1 m of the
+  closed loop over 1 s, so this is the tracker, not replanning. In pickup/drop-off scenes the repair keeps pushing
+  the plan sideways round a cone that the ego then drives into.
+
+`RepairConfig` keys added (each off by default, which is o_am bit for bit: `check_ttc.py --reference` on 40 random
+scenes):
+
+| key | |
+|---|---|
+| `track` | the barriers score `tracker.track(plan)` instead of the plan's poses: nuPlan's `LQRTracker` + `KinematicBicycleModel` (`lqr_tracker.yaml`) in torch, tracking the edited plan from the ego's speed / steering angle / acceleration for the window; within 1e-6 m / 3e-8 rad / 1e-6 m/s of nuPlan's on 30 random plans x 20 steps (`check_tracker.py`), differentiable, float64 inside |
+| `ttc_weight` | nuPlan's `time_to_collision_within_bound` as a barrier: at each scored step the ego box (scored speed, along its heading) and every agent ahead of it (`ttc_ahead_deg` 30, the metric's `is_agent_ahead`; forecast velocity) projected to `ttc_samples` look-ahead times in `(0, ttc_horizon_s]` (1 s); the smallest projected gap under `ttc_margin_m` (0.3 m) is charged |
+| `agent_behind_deg` | a moving agent behind this bearing when it first comes within the margin is not charged (nuPlan: a rear collision with a moving agent is not the ego's fault); 180 = off |
+| `speed_weight` | barrier on the scored speed over the map's speed limit where the ego is (`scene.speed_limit`: the metric's lane / lane-connector lookup at the ego's centre) |
+
+Speeds are the tracked ones with `track`, the plan's central differences otherwise. `posthoc_repair/planner.py`
+passes the ego's dynamic state (and the speed limit when `speed_weight > 0`); per-replan stats gain `c_ttc0` /
+`c_ttc`. Cost: a charged replan takes ~0.45 s plan-space, ~0.9 s with the TTC term, ~3 s with `track` (the 20-step
+rollout runs per iteration), on one CPU thread; a chunk of 70 scenarios takes ~30 min instead of ~25.
+
+Offline, on the logged replans of the 2.5 s before each at-fault collision of `fd_repair_cv` (438 replans, 22
+scenarios), tracked by nuPlan's own controller: the logged plans would collide in 59% of replans, re-repaired in plan
+space 57%, with `track` 32% (median gap -0.07 -> +0.25 m). Twice the trust-region reach or 64 iterations change
+nothing (what is left is too late to avoid), `w_lon_prox: 0` (free retiming) 29%.
+
+### Tuning (FlowDrive, `neighbor_forecast: cv`, Val14's even chunks, then the odd ones held out)
+
+Every arm is paired with a base on the same device (CPU and CUDA draw different noise for one seed: `fd` on CPU vs
+on GPU is -0.94 [-2.03, +0.07] on 559 scenarios, 95 better / 222 worse, a seed effect of ~1 point). Even chunks, 559
+scenarios unless noted; gain over `fd_repair_cv` (o_am) on the same device, 95% bootstrap CI over scenarios:
+
+| arm (`repair:` keys) | device | gain vs o_am | notes |
+|---|---|---|---|
+| `ttc1` (`ttc_weight: 1`) | 2080 Ti | +0.68 [+0.23, +1.23] | TTC 92.49 -> 93.92, collisions 98.12 -> 98.75 |
+| `trk` (`track: true`) | 2080 Ti | +1.94 [+0.91, +3.07] | collisions 98.12 -> 99.28, drivable 98.57 -> 99.28, TTC 92.49 -> 93.92 |
+| `trk_ttc1` (both) | CPU | +3.17 [+1.89, +4.63] (420) | collisions 97.62 -> 99.29, drivable 97.86 -> 99.76, TTC 92.38 -> 95.24; +4.45 [+2.93, +6.10] vs `fd` |
+
+On top of `trk_ttc1` (CPU, vs `trk_ttc1`): `agent_behind_deg: 150` -0.01 (15 scenarios move at all);
+`speed_weight: 1` -0.16 [-0.78, +0.39] (speed limit 97.16 -> 99.13 but progress 95.22 -> 94.35, collisions
+99.46 -> 98.93); `ttc_ahead_deg: 150` (lateral agents too) -0.80 [-1.53, -0.21]; `edge_weight: 3` -0.05. None kept:
+the configuration is `track: true, ttc_weight: 1.0`, the rest at o_am's values.
+
+Val14, FlowDrive (2080 Ti, paired with `fd`, 1118 scenarios): `fd` 91.21, `fd_repair_cv` (o_am) 92.23,
+`fd_repair_cv_trk_ttc1` **94.31**: +2.07 [+1.37, +2.81] over o_am (collisions 98.08 -> 98.88, drivable 98.57 -> 99.55,
+TTC 92.22 -> 95.44, progress 95.74 -> 95.62). Held-out odd chunks (559): 92.28 -> 93.90, +1.63 [+0.68, +2.64].
+
+Val14, Diffusion Planner (the released checkpoint, seeded; 2080 Ti, paired with `base`, 1118 scenarios), the same
+configuration untuned for it: `base` 89.76 (babel's seeded run: 89.76), `repair_cv` (o_am) 90.85, `repair_cv_trk_ttc1`
+**94.01**: +3.16 [+2.29, +4.08] over o_am, +4.26 [+3.16, +5.38] over `base` (collisions 97.67 -> 98.93, drivable
+97.94 -> 99.37, TTC 92.04 -> 96.24, progress 94.40 -> 94.40). Odd chunks: 90.36 -> 93.69, +3.34 [+2.03, +4.76].
+`track` alone on the even chunks: +2.69 [+1.60, +3.87] over o_am. Run as FlowDrive's, with
+`++planner.diffusion_planner_repair.repair.*`, in `/zfsauton/scratch/$USER/nuplan_wm/runs/tune_dp` (`base` and
+`repair_cv` in `runs/val14`).
 
 ## Not done yet
 

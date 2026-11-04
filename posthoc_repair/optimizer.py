@@ -36,6 +36,7 @@ import torch
 
 from anchor_wm.config import EGO_LENGTH, EGO_REAR_TO_CENTER, EGO_WIDTH
 from anchor_wm.geometry import box_corners, edge_signed_distance, wrap_angle
+from posthoc_repair.tracker import track as track_plan
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,21 @@ class RepairConfig:
     agent_margin_m: float = 0.75
     agent_tau_m: float = 0.25
     agent_weight: float = 1.0
+    agent_behind_deg: float = 180.0  # moving agents behind this bearing are not charged (nuPlan: is_agent_behind 150)
+    # nuPlan's time_to_collision_within_bound as a barrier (0 = off, o_am): ego and agents projected at constant velocity
+    ttc_weight: float = 0.0
+    ttc_horizon_s: float = 1.0      # look-ahead; nuPlan fails a projected collision within 0.95 s
+    ttc_samples: int = 5            # look-ahead times on (0, ttc_horizon_s]
+    ttc_margin_m: float = 0.3
+    ttc_tau_m: float = 0.25
+    ttc_ahead_deg: float = 30.0     # agents ahead of the ego's heading within this bearing (nuPlan: is_agent_ahead 30)
+    # score the rollout of nuPlan's LQR tracker + bicycle model on the plan (what the simulator executes; tracker.py)
+    # instead of the plan's own poses (o_am); needs the ego's speed, steering angle and acceleration
+    track: bool = False
+    # nuPlan's speed_limit_compliance: barrier on the scored speed over the map's limit where the ego is (0 = off)
+    speed_weight: float = 0.0
+    speed_margin_mps: float = 0.3
+    speed_tau_mps: float = 1.0
 
     @classmethod
     def from_dict(cls, value: dict | None) -> "RepairConfig":
@@ -224,14 +240,57 @@ def ego_corners(window: torch.Tensor) -> torch.Tensor:
     return box_corners(centre, yaw, lw)
 
 
-def plan_safety(cfg: RepairConfig, window: torch.Tensor, edges: dict, agents: dict) -> dict:
+def plan_speed(plan: torch.Tensor, n: int, dt: float) -> torch.Tensor:
+    """Speed ``[B, n]`` at steps ``1..n`` of ``plan [B, W, 3]``: central differences (backward at the plan's last
+    pose), with a zero gradient at a standstill."""
+    W = plan.shape[1]
+    lo = torch.arange(0, n, device=plan.device)
+    hi = torch.arange(2, n + 2, device=plan.device).clamp(max=W - 1)
+    d = plan[:, hi, :2] - plan[:, lo, :2]
+    moved = (d != 0).any(-1)
+    norm = torch.where(moved, torch.where(moved[..., None], d, torch.ones_like(d)).norm(dim=-1), torch.zeros_like(d[..., 0]))
+    return norm / ((hi - lo).to(plan.dtype) * dt)
+
+
+def bearing(window: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
+    """|angle| ``[B, n, M]`` between each rear-axle pose's heading (``window [B, n, 3]``) and the direction to each
+    point ``xy [B, n, M, 2]`` (nuPlan's ``get_agent_relative_angle``); no gradient."""
+    window, xy = window.detach(), xy.detach()
+    rel = xy - window[:, :, None, :2]
+    c, s = torch.cos(window[..., 2])[..., None], torch.sin(window[..., 2])[..., None]
+    return torch.atan2(-s * rel[..., 0] + c * rel[..., 1], c * rel[..., 0] + s * rel[..., 1]).abs()
+
+
+def ttc_gap(cfg: RepairConfig, window: torch.Tensor, speed: torch.Tensor, agents: dict) -> torch.Tensor:
+    """Smallest projected box gap ``[B, n, M]`` over ``ttc_samples`` look-ahead times in ``(0, ttc_horizon_s]``:
+    the ego box moved at its planned ``speed [B, n]`` along its heading, each agent box along its forecast
+    velocity, as nuPlan's TTC projects them."""
+    box = agents["box"]
+    taus = torch.linspace(cfg.ttc_horizon_s / cfg.ttc_samples, cfg.ttc_horizon_s, cfg.ttc_samples,
+                          device=window.device, dtype=window.dtype)                                  # [S]
+    yaw = window[..., 2]
+    step = speed[..., None] * torch.stack([torch.cos(yaw), torch.sin(yaw)], -1)                     # [B, n, 2]
+    ego = window[:, :, None, :2] + step[:, :, None] * taus[:, None]                                  # [B, n, S, 2]
+    ec = ego_corners(torch.cat([ego, yaw[:, :, None, None].expand(*ego.shape[:3], 1)], -1))          # [B, n, S, 4, 2]
+    a_xy = box[:, :, None, :, :2] + agents["vel"][:, :, None] * taus[:, None, None]                  # [B, n, S, M, 2]
+    oc = box_corners(a_xy, box[:, :, None, :, 4].expand(a_xy.shape[:-1]),
+                     box[:, :, None, :, 2:4].expand(*a_xy.shape[:-1], 2))                            # [B, n, S, M, 4, 2]
+    gap = box_signed_gap(ec[:, :, :, None], yaw[:, :, None, None], oc, box[:, :, None, :, 4])        # [B, n, S, M]
+    return gap.amin(2)
+
+
+def plan_safety(cfg: RepairConfig, window: torch.Tensor, edges: dict, agents: dict,
+                speed: torch.Tensor | None = None, limit: torch.Tensor | None = None) -> dict:
     """Barriers and hard clearances of the scored steps ``window [B, n, 3]``.
 
     ``edges``: the drivable-area boundary, ``anchor_wm.geometry.edge_signed_distance``'s dict (``[B, E, ...]``).
     ``agents``: ``box [B, n, M, 5]`` (x, y, length, width, yaw: box centre), ``valid [B, n, M]``,
-    ``weight [B, n, M]`` (a mode's probability; 1 for a single forecast).
-    Returns per step ``[B, n]``: ``loss``, ``edge_loss``, ``agent_loss``, ``c_edge`` (min over corners, metres
-    inside the metric's limit), ``c_agent`` (min box gap over valid agents; inf without any).
+    ``weight [B, n, M]`` (a mode's probability; 1 for a single forecast), ``vel [B, n, M, 2]`` (for the TTC term
+    and ``agent_behind_deg``). ``speed [B, n]``: the plan's speed at those steps (needed when ``ttc_weight > 0`` or
+    ``speed_weight > 0``); ``limit [B]``: the speed limit where the ego is (inf: none), for ``speed_weight``.
+    Returns per step ``[B, n]``: ``loss``, ``edge_loss``, ``agent_loss``, ``ttc_loss``, ``speed_loss``, ``c_edge`` (min over
+    corners, metres inside the metric's limit), ``c_agent`` (min box gap over valid agents; inf without any),
+    ``c_ttc`` (min projected gap over the agents ahead; inf without any, or with the TTC term off).
     """
     B, n = window.shape[:2]
     corners = ego_corners(window)                                              # [B, n, 4, 2]
@@ -239,17 +298,37 @@ def plan_safety(cfg: RepairConfig, window: torch.Tensor, edges: dict, agents: di
     edge = cfg.edge_weight * barrier(c_edge, cfg.edge_margin_m, cfg.edge_tau_m).sum(-1)
 
     box, valid = agents["box"], agents["valid"].bool()
+    ttc = torch.zeros_like(edge)
+    c_ttc = torch.full_like(edge, float("inf"))
     if box.shape[2]:
         oc = box_corners(box[..., :2], box[..., 4], box[..., 2:4])           # [B, n, M, 4, 2]
         gap = box_signed_gap(corners[:, :, None], window[:, :, None, 2], oc, box[..., 4])   # [B, n, M]
         pair = barrier(gap, cfg.agent_margin_m, cfg.agent_tau_m) * agents["weight"]
-        agent = cfg.agent_weight * torch.where(valid, pair, torch.zeros_like(pair)).sum(-1)
+        charged = valid
+        if cfg.agent_behind_deg < 180.0:
+            # nuPlan classifies a collision at first contact, and a moving agent behind the ego then is not the ego's
+            # fault (ACTIVE_REAR_COLLISION; the track is dropped afterwards): such an agent is not charged at all.
+            behind = (bearing(window, box[..., :2]) > np.deg2rad(cfg.agent_behind_deg)) & (agents["vel"].norm(dim=-1) > 0.05)
+            near = valid & (gap.detach() < cfg.agent_margin_m)                                     # [B, n, M]
+            first = near.to(torch.uint8).argmax(1, keepdim=True)                                   # [B, 1, M]
+            rear = behind.gather(1, first) & near.any(1, keepdim=True)
+            charged = valid & ~rear
+        agent = cfg.agent_weight * torch.where(charged, pair, torch.zeros_like(pair)).sum(-1)
         c_agent = torch.where(valid, gap, torch.full_like(gap, float("inf"))).amin(-1)
+        if cfg.ttc_weight > 0:
+            ahead = valid & (bearing(window, box[..., :2]) < np.deg2rad(cfg.ttc_ahead_deg))
+            g = ttc_gap(cfg, window, speed, agents)
+            pair = barrier(g, cfg.ttc_margin_m, cfg.ttc_tau_m) * agents["weight"]
+            ttc = cfg.ttc_weight * torch.where(ahead, pair, torch.zeros_like(pair)).sum(-1)
+            c_ttc = torch.where(ahead, g, torch.full_like(g, float("inf"))).amin(-1)
     else:
         agent = torch.zeros_like(edge)
         c_agent = torch.full_like(edge, float("inf"))
-    return {"loss": edge + agent, "edge_loss": edge, "agent_loss": agent,
-            "c_edge": c_edge.amin(-1), "c_agent": c_agent}
+    over = torch.zeros_like(edge)
+    if cfg.speed_weight > 0 and limit is not None:
+        over = cfg.speed_weight * barrier(limit.clamp(max=1e3)[:, None] - speed, cfg.speed_margin_mps, cfg.speed_tau_mps)
+    return {"loss": edge + agent + ttc + over, "edge_loss": edge, "agent_loss": agent, "ttc_loss": ttc, "speed_loss": over,
+            "c_edge": c_edge.amin(-1), "c_agent": c_agent, "c_ttc": c_ttc}
 
 
 # ---- the optimizer ----------------------------------------------------------------------------------------
@@ -274,50 +353,81 @@ class PosthocRepair:
         c = self.cfg
         return c.step_m * (1.0 - c.decay ** c.iters) / (1.0 - c.decay) if c.decay != 1.0 else c.step_m * c.iters
 
-    def prune_agents(self, plan: torch.Tensor, n: int, agents: dict) -> dict:
+    def prune_agents(self, plan: torch.Tensor, n: int, agents: dict, tracked: torch.Tensor | None = None) -> dict:
         """Drop the boxes no reachable edit can bring inside the agent margin, which leaves the loss unchanged.
 
         Each of ``d_t``, ``s_t`` moves at most ``reach_m`` (the trust region's schedule), so the rear axle moves at
         most ``sqrt(2) reach`` and the box centre ``EGO_REAR_TO_CENTER`` ahead of it at most another
         ``2 EGO_REAR_TO_CENTER``; a box whose centre stays farther than that plus both half-diagonals plus the
-        margin from the plan's ego centre at every scored step has a zero barrier for every reachable ``x``."""
+        margin from the plan's ego centre at every scored step has a zero barrier for every reachable ``x``.
+        With the TTC term the boxes also move ``ttc_horizon_s`` ahead: the ego at the plan's speed + 2 m/s (exact at
+        ``x = 0``, so a plan clear of every margin is still returned unchanged), the agent at its own. With ``track``
+        the scored poses are the tracker's: a box is kept when it is near the plan or near ``tracked`` (the rollout at
+        ``x = 0``; the tracker smooths the plan, so an edit moves the rollout about as far as the plan or less)."""
         box = agents["box"]
         if not box.shape[2]:
             return agents
+        cfg = self.cfg
         w = plan[:, 1:n + 1]
         centre = w[..., :2] + EGO_REAR_TO_CENTER * torch.stack([torch.cos(w[..., 2]), torch.sin(w[..., 2])], -1)
         bound = (2.0 ** 0.5 * self.reach_m() + 2.0 * EGO_REAR_TO_CENTER + 0.5 * float(np.hypot(EGO_LENGTH, EGO_WIDTH))
-                 + 0.5 * box[..., 2:4].norm(dim=-1) + self.cfg.agent_margin_m + 0.1)                 # [B, n, M]
-        near = ((box[..., :2] - centre[:, :, None]).norm(dim=-1) <= bound) & agents["valid"].bool()
+                 + 0.5 * box[..., 2:4].norm(dim=-1) + max(cfg.agent_margin_m, cfg.ttc_margin_m) + 0.1)  # [B, n, M]
+        if cfg.ttc_weight > 0:
+            speed = plan_speed(plan, n, cfg.dt)
+            if tracked is not None:
+                speed = torch.maximum(speed, (tracked[:, 1:, :2] - tracked[:, :-1, :2]).norm(dim=-1).amax(1, keepdim=True)
+                                      / cfg.dt)
+            bound = bound + cfg.ttc_horizon_s * (speed[..., None] + 2.0 + agents["vel"].norm(dim=-1))
+        near = (box[..., :2] - centre[:, :, None]).norm(dim=-1) <= bound
+        if tracked is not None:
+            c2 = tracked[..., :2] + EGO_REAR_TO_CENTER * torch.stack([torch.cos(tracked[..., 2]), torch.sin(tracked[..., 2])], -1)
+            near = near | ((box[..., :2] - c2[:, :, None]).norm(dim=-1) <= bound)
+        near = near & agents["valid"].bool()
         keep = near.any(1).any(0)                                                                  # [M]
         return {k: v[:, :, keep] for k, v in agents.items()}
 
-    def loss(self, plan, x, n, edges, agents, H):
-        terms = plan_safety(self.cfg, edit_plan(plan, x, n)[:, 1:n + 1], edges, agents)
+    def scored(self, edited: torch.Tensor, n: int, ego: dict | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The poses ``[B, n, 3]`` the barriers score, and their speeds ``[B, n]`` (``None`` when not needed)."""
+        if self.cfg.track:
+            return track_plan(edited, ego["v"], ego["steer"], ego["accel"], n)
+        need = self.cfg.ttc_weight > 0 or self.cfg.speed_weight > 0
+        return edited[:, 1:n + 1], (plan_speed(edited, n, self.cfg.dt) if need else None)
+
+    def loss(self, plan, x, n, edges, agents, H, ego=None):
+        window, speed = self.scored(edit_plan(plan, x, n), n, ego)
+        terms = plan_safety(self.cfg, window, edges, agents, speed, None if ego is None else ego.get("limit"))
         return terms["loss"].sum(-1) / n + 0.5 * torch.einsum("bi,ij,bj->b", x, H, x), terms
 
-    def __call__(self, plan: torch.Tensor, edges: dict, agents: dict) -> tuple[torch.Tensor, dict]:
+    def __call__(self, plan: torch.Tensor, edges: dict, agents: dict, ego: dict | None = None) -> tuple[torch.Tensor, dict]:
+        """``ego``: ``v``, ``steer``, ``accel`` ``[B]`` (rear-axle longitudinal speed, tire steering angle, longitudinal
+        acceleration), the tracker's initial state, needed with ``track``; ``limit`` ``[B]``, for ``speed_weight``."""
         cfg = self.cfg
         B, W, _ = plan.shape
         n = int(min(cfg.window, W - 1))
         H, Hinv = self._hessian(n, plan.device, plan.dtype)
-        agents = self.prune_agents(plan, n, {k: v[:, :n] for k, v in agents.items()})
+        if cfg.track and ego is None:
+            raise ValueError("RepairConfig.track needs the ego's v / steer / accel")
+        with torch.no_grad():
+            tracked = self.scored(plan, n, ego)[0] if cfg.track else None
+        agents = self.prune_agents(plan, n, {k: v[:, :n] for k, v in agents.items()}, tracked)
 
         def project(x):          # the along-path half may not fall more than lon_back_m behind the plan
             return torch.cat([x[:, :n], x[:, n:].clamp(min=-cfg.lon_back_m)], 1)
 
         x0 = torch.zeros(B, 2 * n, device=plan.device, dtype=plan.dtype)
         with torch.no_grad():
-            l0, t0 = self.loss(plan, x0, n, edges, agents, H)
-        info = {"n": n, "loss0": l0, "c_edge0": t0["c_edge"].amin(-1), "c_agent0": t0["c_agent"].amin(-1)}
+            l0, t0 = self.loss(plan, x0, n, edges, agents, H, ego)
+        info = {"n": n, "loss0": l0, "c_edge0": t0["c_edge"].amin(-1), "c_agent0": t0["c_agent"].amin(-1),
+                "c_ttc0": t0["c_ttc"].amin(-1)}
         if not bool((l0 > 0).any()):             # clear of every margin: zero loss, zero gradient, unchanged
             return plan, {**info, "loss": l0, "moved": torch.zeros(B, dtype=torch.bool, device=plan.device),
-                          "shift_m": torch.zeros_like(l0), "c_edge": info["c_edge0"], "c_agent": info["c_agent0"]}
+                          "shift_m": torch.zeros_like(l0), "c_edge": info["c_edge0"], "c_agent": info["c_agent0"],
+                          "c_ttc": info["c_ttc0"]}
 
         x, best_x, best_l = x0, x0, l0
         for k in range(int(cfg.iters)):
             xr = x.detach().requires_grad_(True)
-            l_b, _ = self.loss(plan, xr, n, edges, agents, H)
+            l_b, _ = self.loss(plan, xr, n, edges, agents, H, ego)
             (g,) = torch.autograd.grad(l_b.sum(), xr)
             l_b = l_b.detach()
             better = l_b < best_l
@@ -328,7 +438,7 @@ class PosthocRepair:
             step = step * (cap / step.abs().amax(1, keepdim=True).clamp(min=1e-9)).clamp(max=1.0)
             x = project(x - step)
         with torch.no_grad():
-            l_last, _ = self.loss(plan, x, n, edges, agents, H)
+            l_last, _ = self.loss(plan, x, n, edges, agents, H, ego)
             better = l_last < best_l
             best_x = torch.where(better[:, None], x, best_x)
             best_l = torch.where(better, l_last, best_l)
@@ -337,7 +447,8 @@ class PosthocRepair:
             best_x = torch.where(ok[:, None], best_x, torch.zeros_like(best_x))
             moved = (best_x != 0).any(1)
             out = torch.where(moved[:, None, None], edit_plan(plan, best_x, n), plan)
-            _, t1 = self.loss(plan, best_x, n, edges, agents, H)
+            _, t1 = self.loss(plan, best_x, n, edges, agents, H, ego)
         shift = (out[..., :2] - plan[..., :2]).norm(dim=-1).amax(1)
         return out, {**info, "loss": torch.where(ok, best_l, l0), "moved": moved, "nonfinite": ~ok,
-                     "shift_m": shift, "c_edge": t1["c_edge"].amin(-1), "c_agent": t1["c_agent"].amin(-1)}
+                     "shift_m": shift, "c_edge": t1["c_edge"].amin(-1), "c_agent": t1["c_agent"].amin(-1),
+                     "c_ttc": t1["c_ttc"].amin(-1)}

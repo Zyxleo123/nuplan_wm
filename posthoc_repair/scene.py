@@ -15,6 +15,7 @@ import torch
 
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.common.actor_state.tracked_objects_types import AGENT_TYPES
+from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 
 from anchor_wm.build_cache import drivable_area_arrays
 
@@ -95,6 +96,20 @@ class DrivableArea:
         return {k: v.astype(np.float32) for k, v in out.items()}
 
 
+def speed_limit(map_api, ego_state: EgoState) -> float:
+    """The limit nuPlan's ``speed_limit_compliance`` holds the ego to where it is now: the speed limit of the lane under
+    the ego's centre, or on lane connectors the largest of their incoming / outgoing lanes' (``route_extractor``'s
+    lookup); inf where the map gives none (the metric then counts no violation)."""
+    point = ego_state.center.point
+    lane = map_api.get_one_map_object(point, SemanticMapLayer.LANE)
+    if lane is not None:
+        limits = [lane.speed_limit_mps]
+    else:
+        limits = [e.speed_limit_mps for c in map_api.get_all_map_objects(point, SemanticMapLayer.LANE_CONNECTOR)
+                  for e in c.outgoing_edges + c.incoming_edges]
+    return float(max(limits)) if limits and all(limits) else float("inf")
+
+
 def current_objects(observation, pose: np.ndarray, radius_m: float) -> dict:
     """Every tracked object within ``radius_m`` of the ego, ego frame: box centre ``xy [M, 2]``, ``yaw [M]``,
     ``lw [M, 2]`` (length, width), ``vel [M, 2]`` (0 for static objects), ``is_agent [M]``."""
@@ -115,7 +130,8 @@ def current_objects(observation, pose: np.ndarray, radius_m: float) -> dict:
 
 def forecast_boxes(objects: dict, n: int, dt: float, device, predicted: dict | None = None,
                    match_m: float = 0.5) -> dict:
-    """The repair's ``agents`` dict (batch 1) over steps ``1..n``: constant velocity with the heading held.
+    """The repair's ``agents`` dict (batch 1) over steps ``1..n``: constant velocity with the heading held; ``vel``
+    is each box's velocity (the forecast's finite differences for predicted agents).
 
     ``predicted``: a model's forecast for some agents, ``xy [P, K, T, 2]`` and ``yaw [P, K, T]`` at 0.1 s,
     ``prob [P, K]`` (summing to 1 per agent), and each agent's current box centre ``cur_xy [P, 2]`` and size
@@ -127,6 +143,7 @@ def forecast_boxes(objects: dict, n: int, dt: float, device, predicted: dict | N
     m = len(objects["xy"])
     xy = objects["xy"][None] + objects["vel"][None] * k[..., None]                  # [n, M, 2]
     yaw = np.broadcast_to(objects["yaw"][None], (n, m))
+    vel = np.broadcast_to(objects["vel"][None], (n, m, 2))
     lw, weight = objects["lw"], np.ones(m)
     if predicted is not None and len(predicted["cur_xy"]):
         keep = np.ones(m, bool)
@@ -140,11 +157,14 @@ def forecast_boxes(objects: dict, n: int, dt: float, device, predicted: dict | N
         P, K = predicted["prob"].shape
         pxy = predicted["xy"][:, :, :n].reshape(P * K, n, 2).transpose(1, 0, 2)    # [n, P*K, 2]
         pyaw = predicted["yaw"][:, :, :n].reshape(P * K, n).T
+        prev = np.concatenate([np.repeat(predicted["cur_xy"], K, 0)[None], pxy[:-1]], 0)
         xy = np.concatenate([xy[:, keep], pxy], 1)
         yaw = np.concatenate([yaw[:, keep], pyaw], 1)
+        vel = np.concatenate([vel[:, keep], (pxy - prev) / dt], 1)
         lw = np.concatenate([lw[keep], np.repeat(predicted["lw"], K, 0)], 0)
         weight = np.concatenate([weight[keep], predicted["prob"].reshape(-1)])
     box = np.concatenate([xy, np.broadcast_to(lw[None], (n, len(lw), 2)), yaw[..., None]], -1)
     box = torch.as_tensor(box, dtype=torch.float32, device=device)[None]           # [1, n, M, 5]
     w = torch.as_tensor(np.broadcast_to(weight[None], (n, len(weight))).copy(), dtype=torch.float32, device=device)
-    return {"box": box, "valid": torch.ones(box.shape[:3], dtype=torch.bool, device=device), "weight": w[None]}
+    return {"box": box, "valid": torch.ones(box.shape[:3], dtype=torch.bool, device=device), "weight": w[None],
+            "vel": torch.as_tensor(np.array(vel), dtype=torch.float32, device=device)[None]}

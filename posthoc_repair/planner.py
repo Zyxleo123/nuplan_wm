@@ -33,7 +33,7 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 
 from diffusion_planner.planner.planner import DiffusionPlanner
 from posthoc_repair.optimizer import PosthocRepair, RepairConfig
-from posthoc_repair.scene import NEIGHBOR_FORECASTS, DrivableArea, current_objects, ego_pose, forecast_boxes
+from posthoc_repair.scene import NEIGHBOR_FORECASTS, DrivableArea, current_objects, ego_pose, forecast_boxes, speed_limit
 
 
 class RepairedDiffusionPlanner(DiffusionPlanner):
@@ -112,7 +112,11 @@ class RepairedDiffusionPlanner(DiffusionPlanner):
             predicted = self._anchor(current_input, self._map_api, self._route_roadblock_ids,
                                      self._initialization.mission_goal)
         agents = forecast_boxes(objects, n, cfg.dt, dev, predicted=predicted)
-        out, info = self._repair(torch.as_tensor(plan, dtype=torch.float32, device=dev)[None], edges, agents)
+        dyn = ego_state.dynamic_car_state
+        ego = {k: torch.tensor([v], dtype=torch.float32, device=dev) for k, v in (
+            ("v", dyn.rear_axle_velocity_2d.x), ("steer", ego_state.tire_steering_angle), ("accel", dyn.rear_axle_acceleration_2d.x),
+            ("limit", speed_limit(self._map_api, ego_state) if cfg.speed_weight > 0 else float("inf")))}
+        out, info = self._repair(torch.as_tensor(plan, dtype=torch.float32, device=dev)[None], edges, agents, ego)
         repaired = out[0].cpu().numpy().astype(np.float64)
         self._record(ego_state, info, edges, agents, time.perf_counter() - t0)
         return repaired if bool(info["moved"][0]) else plan
@@ -126,7 +130,7 @@ class RepairedDiffusionPlanner(DiffusionPlanner):
                                             f"{self._map_api.map_name}_{self._t0_us}_{os.getpid()}.jsonl")
         row = {"t_us": int(ego_state.time_us), "ms": round(1e3 * seconds, 2),
                "n_edges": int(edges["edge_xy"].shape[1]), "n_objects": int(agents["box"].shape[2])}
-        for k in ("loss0", "loss", "shift_m", "c_edge0", "c_agent0", "c_edge", "c_agent"):
+        for k in ("loss0", "loss", "shift_m", "c_edge0", "c_agent0", "c_edge", "c_agent", "c_ttc0", "c_ttc"):
             v = float(info[k][0])
             row[k] = round(v, 5) if np.isfinite(v) else None
         row["moved"] = bool(info["moved"][0])
