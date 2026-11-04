@@ -1,0 +1,9 @@
+flow_drive:
+  _target_: flow_drive.planner.planner.FlowDrivePlannerWrapper
+  _convert_: "all"
+
+  # FlowDrive alone (upstream post_mode 0): one flow sample per replan, no guidance, no candidate selection.
+  ckpt_path: ???            # the release: upstream flow_drive/checkpoint/flow_drive_model.pth (epoch 110, the paper's)
+  device: cuda
+  seed: 520                 # replan i draws its noise from seed + i, as upstream; null = unseeded
+  config_file: null         # null = the bundled flow_drive/config/config.yaml

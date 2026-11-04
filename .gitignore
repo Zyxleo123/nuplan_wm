@@ -11,3 +11,4 @@ exp/
 cache/
 checkpoints/
 nuplan-devkit/
+flow_drive/checkpoint/

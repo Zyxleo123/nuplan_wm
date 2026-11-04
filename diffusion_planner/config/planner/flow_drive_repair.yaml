@@ -1,0 +1,17 @@
+flow_drive_repair:
+  _target_: flow_drive.repair_planner.RepairedFlowDrivePlanner
+  _convert_: "all"
+
+  ckpt_path: ???            # FlowDrive's release (flow_drive.yaml)
+  device: cuda
+  seed: 520                 # as flow_drive: replan i draws its noise from seed + i, so enable_repair false == fd
+  config_file: null
+
+  # posthoc_repair: o_am on FlowDrive's plan (posthoc_repair/optimizer.py)
+  neighbor_forecast: cv     # cv | anchor | none (no dp: FlowDrive predicts no neighbours)
+  anchor_ckpt: null         # anchor_wm.train checkpoint, for neighbor_forecast: anchor
+  repair_device: cpu
+  object_radius_m: 60.0
+  repair: {}                # RepairConfig overrides, e.g. {window: 20, agent_margin_m: 0.75}
+  stats_dir: null           # one JSON line per replan, one file per scenario
+  enable_repair: true       # false: FlowDrive alone, through this planner

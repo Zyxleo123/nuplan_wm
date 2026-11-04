@@ -1,0 +1,36 @@
+# Upstream flow_drive/config/config.yaml, the keys inference reads (training paths and settings dropped).
+data_processing:
+  normalization_file_path: null   # defaults to the bundled flow_drive/config/normalization.json
+  agent_num: 32
+  static_objects_num: 5
+  predicted_neighbor_num: 10
+  lane_num: 70
+  lane_len: 20  # number of lane points
+  route_len: 20  # number of route points
+  route_num: 25
+  past_time_horizon: 2  # with 10 hz
+  future_time_horizon: 4  # with 10 hz
+
+encoder:
+  agent_num: 32
+  static_objects_num: 5
+  lane_num: 70
+  hidden_dim: 192
+  encoder_depth: 3
+  num_heads: 6
+  time_len: 21
+  lane_len: 20  # number of lane points
+  static_objects_state_dim: 10
+  encoder_drop_path_rate: 0.1
+  decoder_drop_path_rate: 0.1
+
+diffuser:
+  pred_horizon: 40
+  n_blocks: 3
+  hidden_dim: 192
+  num_heads: 6
+  dropout: 0.1
+
+inference:
+  flow_train_iter: 2000
+  flow_inference_iter: 8

@@ -21,6 +21,14 @@ from concurrent.futures import ThreadPoolExecutor
 import yaml
 
 
+class Token(str):
+    """A scenario token, dumped double-quoted: PyYAML leaves hex like ``9734366e17375822`` bare, and Hydra's loader then
+    reads it as a float (nuPlan: "Expected all scenario tokens to be 16-character strings")."""
+
+
+yaml.SafeDumper.add_representer(Token, lambda d, s: d.represent_scalar("tag:yaml.org,2002:str", s, style='"'))
+
+
 def tokens_in_log(db_file: str, tokens: list[bytes]) -> list[str]:
     con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
     try:
@@ -74,7 +82,7 @@ def main() -> None:
     # Hydra finds `scenario_filter=chunk_000` in <search path>/scenario_filter/.
     os.makedirs(os.path.join(args.out, "scenario_filter"), exist_ok=True)
     for i, logs in enumerate(chunks):
-        f = dict(src, scenario_tokens=[t for lg in sorted(logs) for t in by_log[lg]], log_names=sorted(logs))
+        f = dict(src, scenario_tokens=[Token(t) for lg in sorted(logs) for t in by_log[lg]], log_names=sorted(logs))
         with open(os.path.join(args.out, "scenario_filter", f"chunk_{i:03d}.yaml"), "w") as fh:
             yaml.safe_dump(f, fh, sort_keys=False)
     json.dump({"filter": os.path.abspath(args.filter), "log_of": log_of, "missing": missing,

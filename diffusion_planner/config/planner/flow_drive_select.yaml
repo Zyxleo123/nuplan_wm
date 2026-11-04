@@ -1,0 +1,19 @@
+flow_drive_select:
+  _target_: flow_drive.select_planner.SelectFlowDrivePlanner
+  _convert_: "all"
+
+  ckpt_path: ???            # FlowDrive's release (flow_drive.yaml)
+  device: cuda
+  seed: 520                 # as flow_drive: replan i draws its noise from seed + i
+  config_file: null
+
+  # best-of-K under AnchorWM's scorer (flow_drive/select_planner.py)
+  anchor_ckpt: ???          # anchor_wm.train checkpoint with a trained scorer (also the repair's `anchor` forecast)
+  population: 32            # FlowDrive samples per replan; sample 0 is fd's own (1 without the repair: fd itself)
+  extension: speed          # 4 s -> the scorer's 8 s: speed (constant speed) | decel (constant-rate stop)
+  enable_repair: true       # false: best-of-K on the raw samples
+  neighbor_forecast: cv     # the repair's forecast: cv | anchor | none
+  repair_device: cuda       # the repair runs on the whole population every replan
+  object_radius_m: 60.0
+  repair: {}                # RepairConfig overrides
+  stats_dir: null           # one JSON line per replan, one file per scenario
